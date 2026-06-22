@@ -1,6 +1,7 @@
 (ns metabase.explorations.task.runner-test
   (:require
    [clojure.test :refer :all]
+   [metabase.explorations.interestingness :as explorations.interestingness]
    [metabase.explorations.models.exploration-query-result :as eqr]
    [metabase.explorations.task.runner :as runner]
    [metabase.lib.core :as lib]
@@ -101,6 +102,44 @@
         (is (some? use-row))
         (is (= expl-id (:exploration_id use-row)))
         (is (nil? (:card_id use-row)))))))
+
+(deftest run-one-iteration-writes-interestingness-score-test
+  (testing "A 2-column result gets scored and the score lands on the result row"
+    (mt/with-temp [:model/User u {:email "score@example.com"}
+                   :model/Card card {:type :metric
+                                     :creator_id (:id u)
+                                     :dataset_query (lib/->legacy-MBQL (let [mp (mt/metadata-provider)] (-> (lib/query mp (lib.metadata/table mp (mt/id :venues))) (lib/aggregate (lib/count)))))}]
+      (let [thread (temp-thread! (:id u))
+            row    (pending-query! (:id thread) (:id card)
+                                   (lib/->legacy-MBQL (let [mp (mt/metadata-provider)] (-> (lib/query mp (lib.metadata/table mp (mt/id :venues))) (lib/aggregate (lib/count)) (lib/breakout (lib.metadata/field mp (mt/id :venues :category_id)))))))
+            _      (drain-until-terminal! (:id row) 10)
+            result (t2/select-one :model/ExplorationQueryResult
+                                  :exploration_query_id (:id row))
+            score  (:interestingness_score result)]
+        (is (some? result))
+        (is (double? score))
+        (is (<= 0.0 score 1.0))))))
+
+(deftest run-one-iteration-survives-scoring-failure-test
+  (testing "A scoring exception leaves the row done with a nil score; the result blob is still written"
+    (mt/with-temp [:model/User u {:email "scorefail@example.com"}
+                   :model/Card card {:type :metric
+                                     :creator_id (:id u)
+                                     :dataset_query (lib/->legacy-MBQL (let [mp (mt/metadata-provider)] (-> (lib/query mp (lib.metadata/table mp (mt/id :venues))) (lib/aggregate (lib/count)))))}]
+      (let [thread (temp-thread! (:id u))
+            row    (pending-query! (:id thread) (:id card)
+                                   (lib/->legacy-MBQL (let [mp (mt/metadata-provider)] (-> (lib/query mp (lib.metadata/table mp (mt/id :venues))) (lib/aggregate (lib/count)) (lib/breakout (lib.metadata/field mp (mt/id :venues :category_id)))))))]
+        (mt/with-dynamic-fn-redefs [explorations.interestingness/qp-result->chart-config
+                                    (fn [& _] (throw (ex-info "boom" {})))]
+          (let [final  (drain-until-terminal! (:id row) 10)
+                result (t2/select-one :model/ExplorationQueryResult
+                                      :exploration_query_id (:id row))
+                sr     (stored-result-for (:id row))]
+            (is (= "done" (:status final)))
+            (is (some? result))
+            (is (some? sr))
+            (is (pos? (count (:result_data sr))))
+            (is (nil? (:interestingness_score result)))))))))
 
 (deftest run-one-iteration-error-path-test
   (testing "A row whose query blows up is marked error, no result row is written"
