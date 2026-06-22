@@ -7,6 +7,7 @@
    [metabase.api.routes.common :refer [+auth]]
    [metabase.collections.models.collection :as collection]
    [metabase.events.core :as events]
+   [metabase.explorations.core :as explorations]
    [metabase.explorations.models.exploration :as expl.model]
    [metabase.request.core :as request]
    [metabase.util.malli.registry :as mr]
@@ -115,7 +116,48 @@
    [:collection_id       {:optional true} [:maybe ms/PositiveInt]]
    [:collection_position {:optional true} [:maybe ms/PositiveInt]]])
 
+;;; ----------------------------------------- /dimensions schemas -----------------------------------------
+
+(mr/def ::ExplorationMetric
+  "Schema for a metric in the /dimensions response: dimensions referenced by id only."
+  [:map
+   [:id            ms/PositiveInt]
+   [:name          :string]
+   [:description   [:maybe :string]]
+   [:collection_id [:maybe ms/PositiveInt]]
+   [:collection    {:optional true} [:maybe [:map
+                                             [:id [:maybe ms/PositiveInt]]
+                                             [:name :string]]]]
+   [:dimension_ids        [:sequential :any]]
+   [:dimension_mappings   {:optional true} [:maybe [:sequential :map]]]
+   [:database_id          {:optional true} [:maybe ms/PositiveInt]]
+   [:result_column_name   {:optional true} [:maybe :string]]
+   [:in_library           {:optional true} :boolean]])
+
+(mr/def ::ExplorationDimensionGroup
+  "Schema for a dimension group in the /dimensions response. A group bundles together dimensions that
+   refer to the same underlying source (same field/binning) so the FE can show a single user-facing
+   entry while still tracking the actual per-metric dimensions needed by `start exploration`."
+  [:map
+   [:name                       :string]
+   [:dimension_interestingness  [:maybe number?]]
+   [:dimensions                 [:sequential :map]]])
+
+(mr/def ::DimensionsResponse
+  "Schema for GET /dimensions: metrics referencing dimensions by id, plus the grouped dimension list."
+  [:map
+   [:metrics          [:sequential ::ExplorationMetric]]
+   [:dimension_groups [:sequential ::ExplorationDimensionGroup]]])
+
 ;;; ----------------------------------------- endpoints -----------------------------------------
+
+(api.macros/defendpoint :get "/dimensions" :- ::DimensionsResponse
+  "Hydrated metrics plus a deduplicated dimension list, for the Exploration data modal.
+
+  Optional `q` filters case-insensitively across metric name and dimension display-name."
+  [_route-params
+   {:keys [q]} :- [:maybe [:map [:q {:optional true} [:maybe ms/NonBlankString]]]]]
+  (explorations/exploration-data {:q q}))
 
 (api.macros/defendpoint :post "/" :- ::HydratedExploration
   "Create a new exploration with a single thread and stamp the thread as started."
