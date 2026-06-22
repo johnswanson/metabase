@@ -112,6 +112,23 @@
    [:offset [:maybe ms/IntGreaterThanOrEqualToZero]]
    [:data   [:sequential ::ExplorationSummary]]])
 
+(mr/def ::ExplorationQuerySummary
+  "A planned query row in API responses. The result blob and `dataset_query` aren't asserted
+  here; interestingness scores and timeline scoring are hydrated in later slices."
+  [:map
+   [:id                    ms/PositiveInt]
+   [:exploration_thread_id ms/PositiveInt]
+   [:card_id               ms/PositiveInt]
+   [:segment_id            {:optional true} [:maybe ms/PositiveInt]]
+   [:dimension_id          [:maybe :string]]
+   [:query_type            :string]
+   [:display               {:optional true} [:maybe :string]]
+   [:name                  {:optional true} [:maybe :string]]
+   [:position              ms/IntGreaterThanOrEqualToZero]
+   [:status                :string]
+   [:error_message         {:optional true} [:maybe :string]]
+   [:entity_id             {:optional true} [:maybe :string]]])
+
 (def ^:private MetricSelection
   [:map
    [:card_id ms/PositiveInt]
@@ -268,6 +285,23 @@
   [{:keys [id]} :- [:map [:id ms/PositiveInt]]]
   (let [expl (api/read-check (get-exploration-or-404 id))]
     (hydrate-exploration expl)))
+
+(api.macros/defendpoint :get "/:id/queries" :- [:sequential ::ExplorationQuerySummary]
+  "Lightweight list of an exploration's planned queries — excludes `dataset_query` and the result
+  blob. The frontend polls this while the background planning worker materializes rows."
+  [{:keys [id]} :- [:map [:id ms/PositiveInt]]]
+  (api/read-check (get-exploration-or-404 id))
+  (t2/select [:model/ExplorationQuery
+              :exploration_query.id :exploration_query.exploration_thread_id
+              :exploration_query.card_id :exploration_query.segment_id
+              :exploration_query.dimension_id :exploration_query.query_type
+              :exploration_query.display :exploration_query.name :exploration_query.position
+              :exploration_query.status :exploration_query.error_message
+              :exploration_query.entity_id]
+             {:left-join [:exploration_thread
+                          [:= :exploration_query.exploration_thread_id :exploration_thread.id]]
+              :where     [:= :exploration_thread.exploration_id id]
+              :order-by  [[:exploration_query.position :asc] [:exploration_query.id :asc]]}))
 
 (api.macros/defendpoint :put "/:id" :- ::HydratedExploration
   "Update an exploration's metadata, archive state, or move it to a different collection."
