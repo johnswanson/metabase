@@ -138,7 +138,10 @@
     :model/MetabotFeedback
     :model/MetabotSourceFeedback
     :model/MetabotUsedTable
-    :model/MetabotPrompt]
+    :model/MetabotPrompt
+    ;; 62+
+    :model/Exploration
+    :model/ExplorationThread]
    (when config/ee-available?
      [:model/MetabotPermissions
       :model/MetabotGroupLimit
