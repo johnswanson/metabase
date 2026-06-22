@@ -1077,3 +1077,34 @@ databaseChangeLog:
                   remarks: Set when the user stops a running thread via the cancel endpoint. Set together with `completed_at` so existing terminal-state predicates keep working; `canceled_at IS NOT NULL` is the cause marker that distinguishes a cancel from a natural completion.
                   constraints:
                     nullable: true
+
+  - changeSet:
+      id: v63.qresdesc
+      author: nvoxland
+      comment: Add metric_description column to exploration_query_result
+      changes:
+        - addColumn:
+            tableName: exploration_query_result
+            columns:
+              - column:
+                  name: metric_description
+                  type: ${text.type}
+                  remarks: Description of the underlying metric in business terms
+                  constraints:
+                    nullable: true
+
+  - changeSet:
+      id: v63.87hjhh
+      author: nvoxland
+      comment: Add chart_description column to exploration_query_result
+      changes:
+        - addColumn:
+            tableName: exploration_query_result
+            columns:
+              - column:
+                  name: chart_description
+                  type: ${text.type}
+                  remarks: Description of the metric+dimension combination
+                  constraints:
+                    nullable: true
+
