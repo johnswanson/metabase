@@ -50,6 +50,7 @@
     :model/EmbeddingTheme                    metabase.embedding.models.theme
     :model/Exploration                       metabase.explorations.models.exploration
     :model/ExplorationThread                 metabase.explorations.models.exploration-thread
+    :model/ExplorationThreadGroup            metabase.explorations.models.exploration-thread-group
     :model/Field                             metabase.warehouse-schema.models.field
     :model/FieldUserSettings                 metabase.warehouse-schema.models.field-user-settings
     :model/FieldValues                       metabase.warehouse-schema.models.field-values

@@ -86,6 +86,7 @@
    "DocumentBookmark"
    "Exploration"
    "ExplorationThread"
+   "ExplorationThreadGroup"
    "HTTPAction"
    "ImplicitAction"
    "LoginHistory"

@@ -37,6 +37,22 @@
 (defn- hydrate-exploration [exploration]
   (t2/hydrate exploration :creator :can_write :collection [:threads]))
 
+(defn- positional-rows
+  "Stamp `:exploration_thread_id` and a 0-based `:position` onto each row in `rows`."
+  [thread-id rows]
+  (map-indexed (fn [i row]
+                 (assoc row :exploration_thread_id thread-id :position i))
+               rows))
+
+(defn- insert-thread-groups!
+  "Persist the FE's Research-plan groups verbatim — one `ExplorationThreadGroup` row per
+   group, in payload order. Each group keeps its own `:metrics`/`:dimensions` selection."
+  [thread-id groups]
+  (when (seq groups)
+    (t2/insert! :model/ExplorationThreadGroup
+                (positional-rows thread-id
+                                 (map #(select-keys % [:type :metrics :dimensions]) groups)))))
+
 ;;; ----------------------------------------- schemas -----------------------------------------
 
 (mr/def ::HydratedThread
@@ -96,13 +112,37 @@
    [:offset [:maybe ms/IntGreaterThanOrEqualToZero]]
    [:data   [:sequential ::ExplorationSummary]]])
 
+(def ^:private MetricSelection
+  [:map
+   [:card_id ms/PositiveInt]
+   [:dimension_mappings {:optional true} [:maybe [:sequential :map]]]])
+
+(def ^:private DimensionSelection
+  [:map
+   [:dimension_id   ms/NonBlankString]
+   [:display_name   {:optional true} [:maybe :string]]
+   [:effective_type {:optional true} [:maybe :string]]
+   [:semantic_type  {:optional true} [:maybe :string]]])
+
+(def ^:private GroupSelection
+  "One Research-plan area on the FE — either a metric area (one primary metric + chosen dimensions)
+   or a dimension area (the dimension's group + referencing metrics). Persisted verbatim as one
+   `ExplorationThreadGroup` row; the planners cross this group's metrics with this group's
+   dimensions only."
+  [:map
+   [:type       {:optional true} [:maybe [:enum "metric" "dimension"]]]
+   [:metrics    {:optional true} [:maybe [:sequential MetricSelection]]]
+   [:dimensions {:optional true} [:maybe [:sequential DimensionSelection]]]])
+
 (def ^:private CreateExploration
-  "Body schema for `POST /api/exploration`."
+  "Body schema for `POST /api/exploration`. The FE sends one entry per Research-plan group
+   (`:groups`), each persisted verbatim."
   [:map
    [:name          expl.model/ExplorationName]
    [:description   {:optional true} [:maybe :string]]
    [:prompt        {:optional true} [:maybe :string]]
-   [:collection_id {:optional true} [:maybe ms/PositiveInt]]])
+   [:collection_id {:optional true} [:maybe ms/PositiveInt]]
+   [:groups       {:optional true} [:maybe [:sequential GroupSelection]]]])
 
 (def ^:private UpdateExploration
   "Body schema for `PUT /api/exploration/:id`. All fields are optional; only the keys the client
@@ -163,7 +203,7 @@
   "Create a new exploration with a single thread and stamp the thread as started."
   [_route-params
    _query-params
-   {:keys [name description prompt collection_id]} :- CreateExploration]
+   {:keys [name description prompt collection_id groups]} :- CreateExploration]
   (api/create-check :model/Exploration {:collection_id collection_id})
   (t2/with-transaction [_]
     (let [exploration (first (t2/insert-returning-instances! :model/Exploration
@@ -175,6 +215,7 @@
                                                              {:exploration_id (:id exploration)
                                                               :prompt         prompt
                                                               :position       0}))]
+      (insert-thread-groups! (:id thread) groups)
       (t2/update! :model/ExplorationThread (:id thread) {:started_at (t/offset-date-time)})
       (let [persisted (t2/select-one :model/Exploration :id (:id exploration))]
         (events/publish-event! :event/exploration-create

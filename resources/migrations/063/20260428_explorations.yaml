@@ -248,3 +248,100 @@ databaseChangeLog:
             tableName: exploration_thread
             columnName: entity_id
             columnDataType: char(21)
+
+  - changeSet:
+      id: v63.expthreadgroup
+      author: johnswanson
+      comment: Create exploration_thread_group table
+      changes:
+        - createTable:
+            tableName: exploration_thread_group
+            remarks: One Research-plan block selected on a thread — a set of metrics crossed with a set of dimensions. Immutable after create.
+            columns:
+              - column:
+                  name: id
+                  type: int
+                  autoIncrement: true
+                  remarks: Primary key — surfaced to the FE as the group id
+                  constraints:
+                    primaryKey: true
+                    nullable: false
+              - column:
+                  name: exploration_thread_id
+                  type: int
+                  remarks: The thread this group belongs to
+                  constraints:
+                    nullable: false
+              - column:
+                  name: metrics
+                  type: ${text.type}
+                  remarks: JSON array of selected metrics ({card_id, dimension_mappings}) for this block
+                  constraints:
+                    nullable: true
+              - column:
+                  name: dimensions
+                  type: ${text.type}
+                  remarks: JSON array of selected dimensions ({dimension_id, display_name, effective_type, semantic_type}) for this block
+                  constraints:
+                    nullable: true
+              - column:
+                  name: position
+                  type: int
+                  defaultValueNumeric: 0
+                  remarks: Authoring order of the block within a thread
+                  constraints:
+                    nullable: false
+              - column:
+                  name: created_at
+                  type: ${timestamp_type}
+                  defaultValueComputed: current_timestamp
+                  remarks: When the group was created
+                  constraints:
+                    nullable: false
+              - column:
+                  name: updated_at
+                  type: ${timestamp_type}
+                  defaultValueComputed: current_timestamp
+                  remarks: When the group was last updated
+                  constraints:
+                    nullable: false
+
+  - changeSet:
+      id: v63.etgthreadidx
+      author: nvoxland
+      comment: Index on exploration_thread_group.exploration_thread_id
+      changes:
+        - createIndex:
+            tableName: exploration_thread_group
+            indexName: idx_exploration_thread_group_thread_id
+            columns:
+              - column:
+                  name: exploration_thread_id
+
+  - changeSet:
+      id: v63.expthreadgroupfk
+      author: johnswanson
+      comment: FK exploration_thread_group.exploration_thread_id -> exploration_thread.id
+      changes:
+        - addForeignKeyConstraint:
+            baseTableName: exploration_thread_group
+            baseColumnNames: exploration_thread_id
+            referencedTableName: exploration_thread
+            referencedColumnNames: id
+            constraintName: fk_exploration_thread_group_thread_id
+            onDelete: CASCADE
+
+  - changeSet:
+      id: v63.expgrouptype
+      author: denisberezin
+      comment: Add exploration_thread_group.type
+      changes:
+        - addColumn:
+            tableName: exploration_thread_group
+            columns:
+              - column:
+                  name: type
+                  type: ${text.type}
+                  remarks: Block anchor — "metric" or "dimension"
+                  constraints:
+                    nullable: true

@@ -59,6 +59,7 @@
     :model/DocumentBookmark
     :model/Exploration
     :model/ExplorationThread
+    :model/ExplorationThreadGroup
     :model/CollectionPermissionGraphRevision
     :model/DashboardCardSeries
     :model/LoginHistory
