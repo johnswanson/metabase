@@ -38,6 +38,7 @@
     :model/DatabaseRouter
     :model/Dependency
     :model/DependencyStatus
+    :model/ExplorationQueryResult
     :model/McpQueryHandle
     :model/MetabotConversation
     :model/MetabotGroupLimit
