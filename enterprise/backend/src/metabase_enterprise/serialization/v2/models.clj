@@ -85,6 +85,7 @@
    "DependencyStatus"
    "DocumentBookmark"
    "Exploration"
+   "ExplorationQuery"
    "ExplorationThread"
    "ExplorationThreadGroup"
    "HTTPAction"

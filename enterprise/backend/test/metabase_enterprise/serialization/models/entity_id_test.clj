@@ -58,6 +58,7 @@
     :model/DependencyStatus
     :model/DocumentBookmark
     :model/Exploration
+    :model/ExplorationQuery
     :model/ExplorationThread
     :model/ExplorationThreadGroup
     :model/CollectionPermissionGraphRevision
