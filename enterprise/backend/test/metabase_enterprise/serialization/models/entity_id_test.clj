@@ -58,6 +58,7 @@
     :model/DependencyStatus
     :model/DocumentBookmark
     :model/Exploration
+    :model/ExplorationBookmark
     :model/ExplorationQuery
     :model/ExplorationQueryResult
     :model/ExplorationQueryTimelineInterestingness
