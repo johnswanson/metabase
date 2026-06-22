@@ -1033,3 +1033,47 @@ databaseChangeLog:
                   remarks: JSON-encoded raw stats on the chart
                   constraints:
                     nullable: true
+
+  - changeSet:
+      id: v63.g4ersd
+      author: nvoxland
+      comment: Add exploration_thread.completed_at
+      changes:
+        - addColumn:
+            tableName: exploration_thread
+            columns:
+              - column:
+                  name: completed_at
+                  type: ${timestamp_type}
+                  remarks: Set once when every query in the thread has reached a terminal status (done or error) AND every (query, timeline) pair has been scored. Used as a CAS gate so completion handlers fire exactly once.
+                  constraints:
+                    nullable: true
+
+  - changeSet:
+      id: v63.7438dfsed
+      author: nvoxland
+      comment: Backfill exploration_thread.completed_at for pre-existing threads
+      changes:
+        - update:
+            tableName: exploration_thread
+            columns:
+              - column:
+                  name: completed_at
+                  valueComputed: current_timestamp
+            where: completed_at IS NULL
+      rollback:
+
+  - changeSet:
+      id: v63.expthreadcancelat
+      author: johnswanson
+      comment: Add exploration_thread.canceled_at
+      changes:
+        - addColumn:
+            tableName: exploration_thread
+            columns:
+              - column:
+                  name: canceled_at
+                  type: ${timestamp_type}
+                  remarks: Set when the user stops a running thread via the cancel endpoint. Set together with `completed_at` so existing terminal-state predicates keep working; `canceled_at IS NOT NULL` is the cause marker that distinguishes a cancel from a natural completion.
+                  constraints:
+                    nullable: true
