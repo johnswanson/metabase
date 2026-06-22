@@ -207,7 +207,11 @@
    [:user_interestingness  {:optional true} [:maybe [:enum 0 1 2]]]
    [:entity_id             {:optional true} [:maybe :string]]
    [:interestingness_score            {:optional true} [:maybe number?]]
-   [:contextual_interestingness_score {:optional true} [:maybe number?]]])
+   [:contextual_interestingness_score {:optional true} [:maybe number?]]
+   [:timeline_interestingness         {:optional true} [:maybe [:sequential
+                                                                [:map
+                                                                 [:timeline_id           ms/PositiveInt]
+                                                                 [:interestingness_score {:optional true} [:maybe number?]]]]]]])
 
 (mr/def ::ExplorationQueryStreamResponse
   "Schema for `GET /query/:id`. On success the body is a streamed dataset (api/csv/json/xlsx),
@@ -395,13 +399,15 @@
   blob. The frontend polls this while the background planning worker materializes rows."
   [{:keys [id]} :- [:map [:id ms/PositiveInt]]]
   (api/read-check (get-exploration-or-404 id))
-  (t2/select (into [:model/ExplorationQuery] query-summary-columns)
-             {:left-join [:exploration_thread
-                          [:= :exploration_query.exploration_thread_id :exploration_thread.id]
-                          :exploration_query_result
-                          [:= :exploration_query_result.exploration_query_id :exploration_query.id]]
-              :where     [:= :exploration_thread.exploration_id id]
-              :order-by  [[:exploration_query.position :asc] [:exploration_query.id :asc]]}))
+  (t2/hydrate
+   (t2/select (into [:model/ExplorationQuery] query-summary-columns)
+              {:left-join [:exploration_thread
+                           [:= :exploration_query.exploration_thread_id :exploration_thread.id]
+                           :exploration_query_result
+                           [:= :exploration_query_result.exploration_query_id :exploration_query.id]]
+               :where     [:= :exploration_thread.exploration_id id]
+               :order-by  [[:exploration_query.position :asc] [:exploration_query.id :asc]]})
+   :timeline_interestingness))
 
 (api.macros/defendpoint :post "/:id/restart" :- ::HydratedExploration
   "Re-run an exploration's analysis in place."

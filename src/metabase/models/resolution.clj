@@ -51,6 +51,7 @@
     :model/Exploration                       metabase.explorations.models.exploration
     :model/ExplorationQuery                   metabase.explorations.models.exploration-query
     :model/ExplorationQueryResult            metabase.explorations.models.exploration-query-result
+    :model/ExplorationQueryTimelineInterestingness metabase.explorations.models.exploration-query-timeline-interestingness
     :model/ExplorationThread                 metabase.explorations.models.exploration-thread
     :model/ExplorationThreadGroup            metabase.explorations.models.exploration-thread-group
     :model/ExplorationThreadTimeline         metabase.explorations.models.exploration-thread-timeline

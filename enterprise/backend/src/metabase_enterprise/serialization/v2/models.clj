@@ -87,6 +87,7 @@
    "Exploration"
    "ExplorationQuery"
    "ExplorationQueryResult"
+   "ExplorationQueryTimelineInterestingness"
    "ExplorationThread"
    "ExplorationThreadGroup"
    "ExplorationThreadTimeline"
