@@ -47,7 +47,19 @@
     :max-tokens  - Maximum tokens in the response
     :schema      - JSON Schema map for structured output; each provider forces a
                    tool call (Claude, OpenRouter) or uses json_schema mode (OpenAI)
-    :ai-proxy?   - When true, skip provider auth and use the Metabase AI proxy"
+    :ai-proxy?   - When true, skip provider auth and use the Metabase AI proxy
+    :thinking    - Provider-specific extended-thinking config. For Anthropic,
+                   either of:
+                     - `{:type \"enabled\" :budget_tokens <int>}` (Sonnet 4.6 and
+                       earlier)
+                     - `{:type \"adaptive\" :effort \"high|medium|low\"}` (Opus
+                       4.7+; `:effort` is forwarded as `output_config.effort`)
+                   Only the Claude adapter currently consumes this; other
+                   providers ignore it.
+    :cache?      - Whether to apply Anthropic ephemeral prompt-cache breakpoints
+                   (default true). Set false for one-shot calls that never reread
+                   the prefix, to avoid paying the cache-write premium for zero
+                   cache reads. Anthropic-only; ignored by other adapters."
   [:map
    [:model       {:optional true} :string]
    [:system      {:optional true} [:maybe :string]]
@@ -57,7 +69,9 @@
    [:temperature {:optional true} [:maybe number?]]
    [:max-tokens  {:optional true} [:maybe :int]]
    [:schema      {:optional true} :any]
-   [:ai-proxy?   {:optional true} [:maybe :boolean]]])
+   [:ai-proxy?   {:optional true} [:maybe :boolean]]
+   [:thinking    {:optional true} [:maybe :map]]
+   [:cache?      {:optional true} [:maybe :boolean]]])
 
 (defn mkid
   "Generate a random id"
@@ -152,6 +166,10 @@
                             :id   (:id chunk)
                             :text (->> (map :delta chunks)
                                        (str/join ""))}
+    :reasoning-start       {:type      :reasoning
+                            :id        (:id chunk)
+                            :reasoning (->> (map :delta chunks)
+                                            (str/join ""))}
     :tool-input-start      {:type      :tool-input
                             :id        (:toolCallId chunk)
                             :function  (:toolName chunk)
