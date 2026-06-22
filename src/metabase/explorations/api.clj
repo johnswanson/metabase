@@ -34,6 +34,23 @@
   [query-id]
   (api/read-check (api/check-404 (t2/select-one :model/ExplorationQuery :id query-id))))
 
+(def ^:private query-summary-columns
+  "Column projection for `::ExplorationQuerySummary` rows — excludes `dataset_query` and the
+  result blob. Later slices extend this with the joined interestingness scores."
+  [:exploration_query.id :exploration_query.exploration_thread_id
+   :exploration_query.card_id :exploration_query.segment_id
+   :exploration_query.dimension_id :exploration_query.query_type
+   :exploration_query.display :exploration_query.name :exploration_query.position
+   :exploration_query.status :exploration_query.error_message
+   :exploration_query.user_interestingness
+   :exploration_query.entity_id])
+
+(defn- query-summary
+  "Fetch a single `::ExplorationQuerySummary` row by `exploration_query.id`."
+  [query-id]
+  (t2/select-one (into [:model/ExplorationQuery] query-summary-columns)
+                 {:where [:= :exploration_query.id query-id]}))
+
 (defn- check-destination-collection-perms!
   "When `updates` moves the exploration to a different `collection_id`, verify the current
   user has write perms on the destination (collection or root). Source-side perms are already
@@ -140,6 +157,7 @@
    [:position              ms/IntGreaterThanOrEqualToZero]
    [:status                :string]
    [:error_message         {:optional true} [:maybe :string]]
+   [:user_interestingness  {:optional true} [:maybe [:enum 0 1 2]]]
    [:entity_id             {:optional true} [:maybe :string]]])
 
 (mr/def ::ExplorationQueryStreamResponse
@@ -318,13 +336,7 @@
   blob. The frontend polls this while the background planning worker materializes rows."
   [{:keys [id]} :- [:map [:id ms/PositiveInt]]]
   (api/read-check (get-exploration-or-404 id))
-  (t2/select [:model/ExplorationQuery
-              :exploration_query.id :exploration_query.exploration_thread_id
-              :exploration_query.card_id :exploration_query.segment_id
-              :exploration_query.dimension_id :exploration_query.query_type
-              :exploration_query.display :exploration_query.name :exploration_query.position
-              :exploration_query.status :exploration_query.error_message
-              :exploration_query.entity_id]
+  (t2/select (into [:model/ExplorationQuery] query-summary-columns)
              {:left-join [:exploration_thread
                           [:= :exploration_query.exploration_thread_id :exploration_thread.id]]
               :where     [:= :exploration_thread.exploration_id id]
@@ -371,6 +383,23 @@
       ;; dashboard card that's still loading.
       {:status 409
        :body   (select-keys q [:id :status :error_message :started_at :finished_at])})))
+
+(api.macros/defendpoint :put "/query/:id/interesting" :- ::ExplorationQuerySummary
+  "Set the owner's interestingness rating on an exploration query.
+  `user_interestingness` is `0` (not interesting), `1` (hmm), or `2` (interesting)."
+  [{:keys [id]} :- [:map [:id ms/PositiveInt]]
+   _query-params
+   {:keys [user_interestingness]} :- [:map [:user_interestingness [:enum 0 1 2]]]]
+  (api/write-check (api/check-404 (t2/select-one :model/ExplorationQuery :id id)))
+  (t2/update! :model/ExplorationQuery id {:user_interestingness user_interestingness})
+  (query-summary id))
+
+(api.macros/defendpoint :delete "/query/:id/interesting" :- ::ExplorationQuerySummary
+  "Clear the owner's interestingness rating on an exploration query."
+  [{:keys [id]} :- [:map [:id ms/PositiveInt]]]
+  (api/write-check (api/check-404 (t2/select-one :model/ExplorationQuery :id id)))
+  (t2/update! :model/ExplorationQuery id {:user_interestingness nil})
+  (query-summary id))
 
 (api.macros/defendpoint :put "/:id" :- ::HydratedExploration
   "Update an exploration's metadata, archive state, or move it to a different collection."
