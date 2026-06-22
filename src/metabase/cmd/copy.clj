@@ -143,6 +143,7 @@
     :model/Exploration
     :model/ExplorationThread
     :model/ExplorationThreadGroup
+    :model/ExplorationThreadTimeline
     :model/ExplorationQuery]
    (when config/ee-available?
      [:model/MetabotPermissions
