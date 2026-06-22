@@ -35,6 +35,26 @@
   [query-id]
   (api/read-check (api/check-404 (t2/select-one :model/ExplorationQuery :id query-id))))
 
+(defn- thread-to-restart
+  "The thread a restart re-runs. The exploration UI is single-thread for now, so this is just the
+  exploration's (latest) thread; a future multi-thread UI will pass the thread id explicitly."
+  [exploration-id]
+  (t2/select-one :model/ExplorationThread
+                 :exploration_id exploration-id
+                 {:order-by [[:position :desc] [:id :desc]]}))
+
+(defn- reset-thread-for-rerun!
+  "Clear a thread's prior run so the background worker re-plans and re-executes it: drop its
+  ExplorationQuery rows and reset the plan/terminal state, re-stamping `started_at`."
+  [thread-id]
+  (t2/delete! :model/ExplorationQuery :exploration_thread_id thread-id)
+  (t2/update! :model/ExplorationThread thread-id
+              {:started_at            (t/offset-date-time)
+               :query_plan_started_at nil
+               :query_plan_transcript nil
+               :completed_at          nil
+               :canceled_at           nil}))
+
 (def ^:private query-summary-columns
   "Column projection for `::ExplorationQuerySummary` rows — excludes `dataset_query` and the
   result blob, joins both interestingness scores from `exploration_query_result`."
@@ -368,6 +388,19 @@
                           [:= :exploration_query_result.exploration_query_id :exploration_query.id]]
               :where     [:= :exploration_thread.exploration_id id]
               :order-by  [[:exploration_query.position :asc] [:exploration_query.id :asc]]}))
+
+(api.macros/defendpoint :post "/:id/restart" :- ::HydratedExploration
+  "Re-run an exploration's analysis in place."
+  [{:keys [id]} :- [:map [:id ms/PositiveInt]]]
+  (let [exploration (get-exploration-or-404 id)
+        _           (api/write-check exploration)
+        thread      (api/check-404 (thread-to-restart id))]
+    (t2/with-transaction [_]
+      (reset-thread-for-rerun! (:id thread))
+      (let [updated (t2/select-one :model/Exploration :id id)]
+        (events/publish-event! :event/exploration-update
+                               {:object updated :user-id api/*current-user-id*})
+        (hydrate-exploration updated)))))
 
 (defn- stream-stored-result
   "Replay a worker-serialized QP result (gzipped+nippy bytes from `:model/StoredResult.result_data`)
