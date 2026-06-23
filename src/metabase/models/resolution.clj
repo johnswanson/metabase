@@ -49,7 +49,8 @@
     :model/DocumentBookmark                  metabase.bookmarks.models.bookmark
     :model/EmbeddingTheme                    metabase.embedding.models.theme
     :model/Exploration                       metabase.explorations.models.exploration
-    :model/ExplorationQuery                   metabase.explorations.models.exploration-query
+    :model/ExplorationBookmark               metabase.bookmarks.models.bookmark
+    :model/ExplorationQuery                  metabase.explorations.models.exploration-query
     :model/ExplorationQueryResult            metabase.explorations.models.exploration-query-result
     :model/ExplorationQueryTimelineInterestingness metabase.explorations.models.exploration-query-timeline-interestingness
     :model/ExplorationThread                 metabase.explorations.models.exploration-thread

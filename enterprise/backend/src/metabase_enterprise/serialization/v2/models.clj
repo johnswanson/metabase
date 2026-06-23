@@ -85,6 +85,7 @@
    "DependencyStatus"
    "DocumentBookmark"
    "Exploration"
+   "ExplorationBookmark"
    "ExplorationQuery"
    "ExplorationQueryResult"
    "ExplorationQueryTimelineInterestingness"
