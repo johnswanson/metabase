@@ -1809,6 +1809,7 @@
                     :model/Collection
                     :model/Dashboard
                     :model/Database
+                    :model/StoredResult
                     :model/Table}}
 
   query-permissions
