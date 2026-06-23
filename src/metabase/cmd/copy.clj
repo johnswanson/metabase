@@ -142,7 +142,8 @@
     ;; 62+
     :model/Exploration
     :model/ExplorationThread
-    :model/ExplorationThreadGroup]
+    :model/ExplorationThreadGroup
+    :model/ExplorationQuery]
    (when config/ee-available?
      [:model/MetabotPermissions
       :model/MetabotGroupLimit
