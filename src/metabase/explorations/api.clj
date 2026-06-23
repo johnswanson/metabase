@@ -234,6 +234,7 @@
               {:started_at            (t/offset-date-time)
                :query_plan_started_at nil
                :query_plan_transcript nil
+               :analysis_started_at   nil
                :completed_at          nil
                :canceled_at           nil}))
 

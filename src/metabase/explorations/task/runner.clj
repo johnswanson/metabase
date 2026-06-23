@@ -1,23 +1,29 @@
 (ns metabase.explorations.task.runner
-  "Background worker for the Explorations pipeline. In this slice it drains two queues:
+  "Background worker that drains pending `:model/ExplorationQuery` rows. Each iteration claims one
+  row with `FOR UPDATE SKIP LOCKED`, runs the snapshotted MBQL through the QP, writes the
+  serialized result to `:model/ExplorationQueryResult`, and commits the whole thing in a single
+  transaction. Crash recovery is automatic: a JVM kill drops the connection, the DB rolls back
+  the tx, and the row is left as `pending` for another worker to pick up.
 
-  *Planning* — it claims a thread that has been started but never planned
-  (`started_at IS NOT NULL`, `query_plan_started_at IS NULL`, no `exploration_query`
-  rows yet) via a CAS on `query_plan_started_at`, runs the planner, and materializes the
-  resulting `:model/ExplorationQuery` rows (status `pending`).
+  Each iteration also handles per-`(query, timeline)` interestingness scoring: when no query is
+  pending, the worker looks for a thread-selected timeline that hasn't yet been scored against a
+  done query in the same thread, claims the pair via INSERT (the unique constraint serializes
+  competing claims), runs the LLM scorer, and UPDATEs the row with the score. The INSERT and
+  UPDATE are deliberately separate autocommits — wrapping them in one transaction would hold the
+  unique-index lock for the duration of the LLM call and serialize all scoring workers.
 
-  *Execution* — it claims one pending `:model/ExplorationQuery` row with `FOR UPDATE SKIP
-  LOCKED`, runs the snapshotted MBQL through the QP, writes the serialized result to
-  `:model/ExplorationQueryResult` (backed by a `:model/StoredResult`), and commits the whole
-  thing in a single transaction. Crash recovery is automatic: a JVM kill drops the connection,
-  the DB rolls back the tx, and the row is left as `pending` for another worker to pick up.
-
-  Later slices extend the worker loop with the scoring, timeline, and completion phases."
+  Crash recovery is via stale-row reclaim: rows whose `scored_at` is still `NULL` longer than
+  [[stale-claim-cutoff-minutes]] are eligible for re-claim by a future iteration. The cutoff
+  comfortably exceeds metabot.self's bounded retry budget for a single LLM call, so a still-alive
+  worker will never be stale-reclaimed. A *caught* scorer failure (poison input, transient LLM
+  error past retries) writes a sentinel row with `score=NULL, scored_at=NOW()` so that pair isn't
+  retried forever."
   (:require
    [clojure.string :as str]
    [medley.core :as m]
    [metabase.app-db.core :as mdb]
    [metabase.contextual-interestingness.core :as contextual-interestingness]
+   [metabase.explorations.ai-summary :as explorations.ai-summary]
    [metabase.explorations.interestingness :as explorations.interestingness]
    [metabase.explorations.query-plan :as explorations.query-plan]
    [metabase.explorations.query-plan.context :as qp.context]
@@ -164,6 +170,84 @@
                  (:id exploration-query))
       nil)))
 
+(defn- claim-analysis-if-ready!
+  "Atomically flip `exploration_thread.analysis_started_at` from NULL to NOW() iff every
+  query on the thread has reached a terminal status (anything other than `pending`)
+  AND every (query, timeline) pair has `scored_at` set. Returns true iff this caller
+  was the one that claimed it — the unique caller who should run the handler. The
+  matching `completed_at` flip happens later, after the handler finishes."
+  [thread-id]
+  (pos?
+   (t2/query-one
+    {:update :exploration_thread
+     :set    {:analysis_started_at (OffsetDateTime/now)}
+     :where  [:and
+              [:= :id thread-id]
+              [:= :analysis_started_at nil]
+              [:= :canceled_at nil]
+              [:not-exists {:select [1]
+                            :from   [:exploration_query]
+                            :where  [:and
+                                     [:= :exploration_thread_id thread-id]
+                                     [:= :status "pending"]]}]
+              [:not-exists {:select    [1]
+                            :from      [[:exploration_query :q]]
+                            :join      [[:exploration_thread_timeline :ett]
+                                        [:= :ett.exploration_thread_id :q.exploration_thread_id]]
+                            :left-join [[:exploration_query_timeline_interestingness :s]
+                                        [:and
+                                         [:= :s.exploration_query_id :q.id]
+                                         [:= :s.timeline_id :ett.timeline_id]]]
+                            :where     [:and
+                                        [:= :q.exploration_thread_id thread-id]
+                                        [:= :q.status "done"]
+                                        [:or
+                                         [:= :s.id nil]
+                                         [:= :s.scored_at nil]]]}]]})))
+
+(defn- mark-thread-fully-completed!
+  "Set `completed_at` to NOW(). Called after the ai-summary handler has finished
+  (success, skip, or failure). This is what the UI polls on to decide it's done
+  watching the thread."
+  [thread-id]
+  (t2/update! :model/ExplorationThread thread-id {:completed_at (OffsetDateTime/now)}))
+
+(defn- on-thread-completed
+  "Single entry point for post-completion work. Always invoked with `thread-id` (a long)
+  exactly once per thread, on a background daemon thread. Runs after the runner's row
+  transaction has committed, so it's free to do its own DB I/O, HTTP, LLM calls, etc.
+
+  Stamps `completed_at` last so the UI's polling loop sees a clean done signal only
+  after the ai-summary doc has been written (or failed)."
+  [thread-id]
+  (log/infof "Exploration thread %d: queries+scoring done, running ai-summary" thread-id)
+  (try
+    (explorations.ai-summary/generate-ai-summary! thread-id)
+    (catch Throwable e
+      (log/errorf e "generate-ai-summary! threw for thread %d" thread-id))
+    (finally
+      (try
+        (mark-thread-fully-completed! thread-id)
+        (catch Throwable e
+          (log/errorf e "Failed to set completed_at for thread %d" thread-id))))))
+
+(defn- maybe-complete-thread!
+  "Invoke after any state transition that could be the last unit of work for `thread-id`
+  (a query reaching a terminal status, or a timeline pair being scored). If this call is
+  the one that claims the analysis run, runs `on-thread-completed` on a background
+  `future`. Safe to call repeatedly: subsequent calls are no-ops thanks to the
+  `analysis_started_at IS NULL` predicate.
+
+  `thread-id` may be nil (e.g. the runner couldn't resolve the thread for a now-deleted
+  query); in that case this is a no-op."
+  [thread-id]
+  (when (and thread-id (claim-analysis-if-ready! thread-id))
+    (future
+      (try
+        (on-thread-completed thread-id)
+        (catch Throwable e
+          (log/errorf e "on-thread-completed failed for thread %d" thread-id))))))
+
 (defn- exploration-creator-id
   "Walk EQ → ExplorationThread → Exploration.creator_id for stamping onto the stored_result."
   [exploration-query]
@@ -289,9 +373,9 @@
       nil)))
 
 (defn- execute-and-persist-query-result!
-  "Run the QP on `row`'s `:dataset_query`, compute the chart-config / stats / interestingness score
-  via the `safe-*` helpers, persist a `StoredResult` + `ExplorationQueryResult` + `StoredResultUse`,
-  and flip the `ExplorationQuery` to `done`. `started` is the `OffsetDateTime` to stamp as the row's
+  "Run the QP on `row`'s `:dataset_query`, compute the chart-config / stats / scores via the
+  `safe-*` helpers, persist a `StoredResult` + `ExplorationQueryResult` + `StoredResultUse`, and
+  flip the `ExplorationQuery` to `done`. `started` is the `OffsetDateTime` to stamp as the row's
   `:started_at`.
 
   The query runs as the exploration's creator, so the snapshot reflects the creator's own lens —
@@ -345,72 +429,31 @@
 
 (defn- run-one-query-iteration!
   "Try to claim and execute a single pending query. Returns truthy when work was done so the
-  caller knows whether to sleep."
+  caller knows whether to sleep.
+
+  Returns `{:thread-id ...}` on a row transition so the caller can run the
+  thread-completion check after the claim transaction commits — we don't want the
+  completion CAS UPDATE (or any handlers it triggers) inside the row's transaction
+  because it would extend the lock window."
   []
-  (t2/with-transaction [_conn]
-    (when-let [row (claim-pending-query)]
-      (let [started (OffsetDateTime/now)]
-        (try
-          (execute-and-persist-query-result! (finalize-row! row) started)
-          (catch Throwable e
-            (log/errorf e "ExplorationQuery %d failed" (:id row))
-            (t2/update! :model/ExplorationQuery (:id row)
-                        {:status        "error"
-                         :error_message (.getMessage e)
-                         :started_at    started
-                         :finished_at   (OffsetDateTime/now)}))))
+  (let [row-thread (atom nil)]
+    (t2/with-transaction [_conn]
+      (when-let [row (claim-pending-query)]
+        (reset! row-thread (:exploration_thread_id row))
+        (let [started (OffsetDateTime/now)]
+          (try
+            (execute-and-persist-query-result! (finalize-row! row) started)
+            (catch Throwable e
+              (log/errorf e "ExplorationQuery %d failed" (:id row))
+              (t2/update! :model/ExplorationQuery (:id row)
+                          {:status        "error"
+                           :error_message (.getMessage e)
+                           :started_at    started
+                           :finished_at   (OffsetDateTime/now)}))))
+        :worked))
+    (when-let [tid @row-thread]
+      (maybe-complete-thread! tid)
       :worked)))
-
-(defn- claim-unplanned-thread!
-  "CAS-claim the next thread that has been started but never planned:
-  `started_at IS NOT NULL`, `query_plan_started_at IS NULL`, and no
-  `exploration_query` rows yet. Returns the claimed thread id, or nil when
-  there's no work or we lost the race. The CAS makes this safe under multiple
-  workers: only one update will affect a given row."
-  []
-  (let [thread-id (t2/select-one-fn
-                   :id :model/ExplorationThread
-                   {:where    [:and
-                               [:not= :started_at nil]
-                               [:= :query_plan_started_at nil]
-                               [:= :canceled_at nil]
-                               [:not-exists {:select [1]
-                                             :from   [:exploration_query]
-                                             :where  [:= :exploration_query.exploration_thread_id
-                                                      :exploration_thread.id]}]]
-                    :order-by [[:id :asc]]
-                    :limit    1})]
-    (when thread-id
-      (when (pos? (t2/update! :model/ExplorationThread
-                              :id                    thread-id
-                              :query_plan_started_at nil
-                              {:query_plan_started_at (OffsetDateTime/now)}))
-        thread-id))))
-
-(defn- canceled-mid-plan-cleanup!
-  "Planner-race repair: the user can cancel a thread *after* the planner claimed it (set
-  `query_plan_started_at`) but *before* `generate-query-plan!` returned. The cancel endpoint's
-  bulk pending→canceled UPDATE only saw the EQ rows that existed at cancel time; rows the planner
-  inserted after that are still `pending` on a canceled thread. Flip them here so the EQ table
-  matches its owning thread's terminal state."
-  [thread-id]
-  (when (t2/exists? :model/ExplorationThread :id thread-id :canceled_at [:not= nil])
-    (t2/update! :model/ExplorationQuery
-                {:exploration_thread_id thread-id
-                 :status                "pending"}
-                {:status "canceled"})))
-
-(defn- run-one-plan-iteration!
-  "Try to claim one unplanned thread and run the planner against it. Returns
-  truthy when work was done so the worker loop knows whether to sleep."
-  []
-  (when-let [thread-id (claim-unplanned-thread!)]
-    (try
-      (explorations.query-plan/generate-query-plan! thread-id)
-      (catch Throwable e
-        (log/errorf e "Exploration thread %d: query plan iteration crashed" thread-id)))
-    (canceled-mid-plan-cleanup! thread-id)
-    :worked))
 
 (def ^:private ^:const stale-claim-cutoff-minutes
   "How long after a claim row's `created_at` we treat it as stale and reclaimable. Bounded above
@@ -524,12 +567,69 @@
                          nil))]
       (t2/update! :model/ExplorationQueryTimelineInterestingness id
                   {:interestingness_score score
-                   :scored_at             (OffsetDateTime/now)}))
+                   :scored_at             (OffsetDateTime/now)})
+      (maybe-complete-thread! (:exploration_thread_id eq)))
+    :worked))
+
+(defn- claim-unplanned-thread!
+  "CAS-claim the next thread that has been started but never planned:
+  `started_at IS NOT NULL`, `query_plan_started_at IS NULL`, and no
+  `exploration_query` rows yet. Returns the claimed thread id, or nil when
+  there's no work or we lost the race. The CAS makes this safe under multiple
+  workers: only one update will affect a given row."
+  []
+  (let [thread-id (t2/select-one-fn
+                   :id :model/ExplorationThread
+                   {:where    [:and
+                               [:not= :started_at nil]
+                               [:= :query_plan_started_at nil]
+                               [:= :canceled_at nil]
+                               [:not-exists {:select [1]
+                                             :from   [:exploration_query]
+                                             :where  [:= :exploration_query.exploration_thread_id
+                                                      :exploration_thread.id]}]]
+                    :order-by [[:id :asc]]
+                    :limit    1})]
+    (when thread-id
+      (when (pos? (t2/update! :model/ExplorationThread
+                              :id                    thread-id
+                              :query_plan_started_at nil
+                              {:query_plan_started_at (OffsetDateTime/now)}))
+        thread-id))))
+
+(defn- canceled-mid-plan-cleanup!
+  "Planner-race repair: the user can cancel a thread *after* the planner claimed it (set
+  `query_plan_started_at`) but *before* `generate-query-plan!` returned. The cancel endpoint's
+  bulk pending→canceled UPDATE only saw the EQ rows that existed at cancel time; rows the planner
+  inserted after that are still `pending` on a canceled thread. Flip them here so the EQ table
+  matches its owning thread's terminal state."
+  [thread-id]
+  (when (t2/exists? :model/ExplorationThread :id thread-id :canceled_at [:not= nil])
+    (t2/update! :model/ExplorationQuery
+                {:exploration_thread_id thread-id
+                 :status                "pending"}
+                {:status "canceled"})))
+
+(defn- run-one-plan-iteration!
+  "Try to claim one unplanned thread and run the planner against it. Returns
+  truthy when work was done so the worker loop knows whether to sleep."
+  []
+  (when-let [thread-id (claim-unplanned-thread!)]
+    (try
+      (explorations.query-plan/generate-query-plan! thread-id)
+      (catch Throwable e
+        (log/errorf e "Exploration thread %d: query plan iteration crashed" thread-id)))
+    (canceled-mid-plan-cleanup! thread-id)
+    ;; A successful plan inserts ExplorationQuery rows; downstream iterations
+    ;; will execute them. A failed plan terminally stamps the thread, so the
+    ;; completion-check we run below is also the right thing — no queries, but
+    ;; `analysis_started_at` is already set so it short-circuits.
+    (maybe-complete-thread! thread-id)
     :worked))
 
 (defn- run-one-iteration!
-  "Do one unit of work: plan any unplanned threads first, then execute pending
-  queries, then score (query, timeline) pairs. Returns truthy when something was processed."
+  "Do one unit of work: plan any unplanned threads first, then queries, then
+  timeline scoring. Returns truthy when something was processed."
   []
   (or (run-one-plan-iteration!)
       (run-one-query-iteration!)
