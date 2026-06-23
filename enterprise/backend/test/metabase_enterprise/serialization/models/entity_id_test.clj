@@ -62,6 +62,7 @@
     :model/ExplorationQueryResult
     :model/ExplorationThread
     :model/ExplorationThreadGroup
+    :model/ExplorationThreadTimeline
     :model/StoredResult
     :model/StoredResultUse
     :model/CollectionPermissionGraphRevision

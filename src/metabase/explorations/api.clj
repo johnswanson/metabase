@@ -100,7 +100,7 @@
         (api/write-check collection/root-collection)))))
 
 (defn- hydrate-exploration [exploration]
-  (t2/hydrate exploration :creator :can_write :collection [:threads]))
+  (t2/hydrate exploration :creator :can_write :collection [:threads :timelines]))
 
 (defn- positional-rows
   "Stamp `:exploration_thread_id` and a 0-based `:position` onto each row in `rows`."
@@ -118,6 +118,12 @@
                 (positional-rows thread-id
                                  (map #(select-keys % [:type :metrics :dimensions]) groups)))))
 
+(defn- insert-thread-timelines! [thread-id timeline-ids]
+  (when (seq timeline-ids)
+    (t2/insert! :model/ExplorationThreadTimeline
+                (positional-rows thread-id
+                                 (map (fn [tl-id] {:timeline_id tl-id}) timeline-ids)))))
+
 ;;; ----------------------------------------- schemas -----------------------------------------
 
 (mr/def ::HydratedThread
@@ -127,7 +133,13 @@
    [:exploration_id ms/PositiveInt]
    [:prompt         {:optional true} [:maybe :string]]
    [:position       ms/IntGreaterThanOrEqualToZero]
-   [:started_at     {:optional true} [:maybe :any]]])
+   [:started_at     {:optional true} [:maybe :any]]
+   [:timelines      {:optional true}
+    [:maybe [:sequential
+             [:map
+              [:timeline_id ms/PositiveInt]
+              [:position    {:optional true} ms/IntGreaterThanOrEqualToZero]
+              [:timeline    {:optional true} [:maybe :map]]]]]]])
 
 (mr/def ::HydratedExploration
   "Schema for an Exploration with hydrated creator and threads."
@@ -249,7 +261,8 @@
    [:description   {:optional true} [:maybe :string]]
    [:prompt        {:optional true} [:maybe :string]]
    [:collection_id {:optional true} [:maybe ms/PositiveInt]]
-   [:groups       {:optional true} [:maybe [:sequential GroupSelection]]]])
+   [:groups       {:optional true} [:maybe [:sequential GroupSelection]]]
+   [:timeline_ids  {:optional true} [:maybe [:sequential ms/PositiveInt]]]])
 
 (def ^:private UpdateExploration
   "Body schema for `PUT /api/exploration/:id`. All fields are optional; only the keys the client
@@ -310,7 +323,7 @@
   "Create a new exploration with a single thread and stamp the thread as started."
   [_route-params
    _query-params
-   {:keys [name description prompt collection_id groups]} :- CreateExploration]
+   {:keys [name description prompt collection_id groups timeline_ids]} :- CreateExploration]
   (api/create-check :model/Exploration {:collection_id collection_id})
   (t2/with-transaction [_]
     (let [exploration (first (t2/insert-returning-instances! :model/Exploration
@@ -323,6 +336,7 @@
                                                               :prompt         prompt
                                                               :position       0}))]
       (insert-thread-groups! (:id thread) groups)
+      (insert-thread-timelines! (:id thread) timeline_ids)
       (t2/update! :model/ExplorationThread (:id thread) {:started_at (t/offset-date-time)})
       (let [persisted (t2/select-one :model/Exploration :id (:id exploration))]
         (events/publish-event! :event/exploration-create

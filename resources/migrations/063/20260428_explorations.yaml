@@ -1108,3 +1108,103 @@ databaseChangeLog:
                   constraints:
                     nullable: true
 
+
+  - changeSet:
+      id: v63.bhresdfg
+      author: nvoxland
+      comment: Create exploration_thread_timeline join table
+      changes:
+        - createTable:
+            tableName: exploration_thread_timeline
+            remarks: Timelines associated with a thread.
+            columns:
+              - column:
+                  name: id
+                  type: int
+                  autoIncrement: true
+                  remarks: Primary key
+                  constraints:
+                    primaryKey: true
+                    nullable: false
+              - column:
+                  name: exploration_thread_id
+                  type: int
+                  remarks: The thread this timeline belongs to
+                  constraints:
+                    nullable: false
+              - column:
+                  name: timeline_id
+                  type: int
+                  remarks: The associated timeline
+                  constraints:
+                    nullable: false
+              - column:
+                  name: position
+                  type: int
+                  defaultValueNumeric: 0
+                  remarks: Ordering of timelines within a thread
+                  constraints:
+                    nullable: false
+              - column:
+                  name: created_at
+                  type: ${timestamp_type}
+                  defaultValueComputed: current_timestamp
+                  remarks: When the selection was created
+                  constraints:
+                    nullable: false
+              - column:
+                  name: updated_at
+                  type: ${timestamp_type}
+                  defaultValueComputed: current_timestamp
+                  remarks: When the selection was last updated
+                  constraints:
+                    nullable: false
+
+  - changeSet:
+      id: v63.89yrbea
+      author: nvoxland
+      comment: Unique constraint on exploration_thread_timeline (thread, timeline)
+      changes:
+        - addUniqueConstraint:
+            tableName: exploration_thread_timeline
+            columnNames: exploration_thread_id, timeline_id
+            constraintName: uq_exploration_thread_timeline_thread_timeline
+
+  - changeSet:
+      id: v63.b89rae
+      author: nvoxland
+      comment: FK exploration_thread_timeline.exploration_thread_id -> exploration_thread.id
+      changes:
+        - addForeignKeyConstraint:
+            baseTableName: exploration_thread_timeline
+            baseColumnNames: exploration_thread_id
+            referencedTableName: exploration_thread
+            referencedColumnNames: id
+            constraintName: fk_exploration_thread_timeline_thread_id
+            onDelete: CASCADE
+
+  - changeSet:
+      id: v63.ettltimelineidx
+      author: nvoxland
+      comment: Index on exploration_thread_timeline.timeline_id
+      changes:
+        - createIndex:
+            tableName: exploration_thread_timeline
+            indexName: idx_exploration_thread_timeline_timeline_id
+            columns:
+              - column:
+                  name: timeline_id
+
+  - changeSet:
+      id: v63.hvdawe
+      author: nvoxland
+      comment: FK exploration_thread_timeline.timeline_id -> timeline.id
+      changes:
+        - addForeignKeyConstraint:
+            baseTableName: exploration_thread_timeline
+            baseColumnNames: timeline_id
+            referencedTableName: timeline
+            referencedColumnNames: id
+            constraintName: fk_exploration_thread_timeline_timeline_id
+            onDelete: CASCADE
+

@@ -8,4 +8,5 @@
 
 (p/import-vars
  [metabase.timeline.models.timeline-event
-  dashcard-timeline-events])
+  dashcard-timeline-events
+  include-events])

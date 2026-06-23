@@ -53,6 +53,7 @@
     :model/ExplorationQueryResult            metabase.explorations.models.exploration-query-result
     :model/ExplorationThread                 metabase.explorations.models.exploration-thread
     :model/ExplorationThreadGroup            metabase.explorations.models.exploration-thread-group
+    :model/ExplorationThreadTimeline         metabase.explorations.models.exploration-thread-timeline
     :model/Field                             metabase.warehouse-schema.models.field
     :model/FieldUserSettings                 metabase.warehouse-schema.models.field-user-settings
     :model/FieldValues                       metabase.warehouse-schema.models.field-values
