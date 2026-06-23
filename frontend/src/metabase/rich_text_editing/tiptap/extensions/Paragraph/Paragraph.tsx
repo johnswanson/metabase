@@ -25,7 +25,7 @@ export const CustomParagraph = Paragraph.extend({
   },
 
   addProseMirrorPlugins() {
-    return [createProseMirrorPlugin(Paragraph.name)];
+    return [createProseMirrorPlugin("paragraph")];
   },
 });
 
@@ -75,7 +75,7 @@ export const ParagraphNodeView = ({
       {shouldShowMenus && document && (
         <CommentsMenu
           active={isOpen}
-          href={`/document/${document.id}/comments/${_id}`}
+          childTargetId={_id}
           ref={commentsRefs.setFloating}
           show={isOpen || hovered}
           style={commentsFloatingStyles}

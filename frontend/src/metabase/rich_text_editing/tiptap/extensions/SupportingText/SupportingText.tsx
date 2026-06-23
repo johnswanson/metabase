@@ -14,6 +14,7 @@ import cx from "classnames";
 import { push } from "react-router-redux";
 import { t } from "ttag";
 
+import { useCommentUrl } from "metabase/documents/hooks/use-comment-url";
 import { useNodeInViewport } from "metabase/documents/hooks/use-node-in-viewport";
 import { useUnresolvedCommentsCount } from "metabase/documents/hooks/use-unresolved-comments-count";
 import {
@@ -121,7 +122,7 @@ export const SupportingText = Node.create<{
   },
 
   addProseMirrorPlugins() {
-    return [createProseMirrorPlugin(this.name)];
+    return [createProseMirrorPlugin("supportingText")];
   },
 });
 
@@ -145,9 +146,10 @@ const SupportingTextComponent = ({
     skip: !isInViewport,
   });
   const isOpen = childTargetId === _id;
-  const commentsPath = document
-    ? `/document/${document.id}/comments/${_id}`
-    : "";
+  const commentsPath = useCommentUrl({
+    childTargetId: _id,
+    searchParams: unresolvedCommentsCount > 0 ? undefined : { new: "true" },
+  });
   const dispatch = useDispatch();
 
   const canWrite = editor.options.editable;
@@ -240,13 +242,7 @@ const SupportingTextComponent = ({
             unresolvedCommentsCount={unresolvedCommentsCount}
             onClick={(e) => {
               e.preventDefault();
-              dispatch(
-                push(
-                  unresolvedCommentsCount > 0
-                    ? commentsPath
-                    : `${commentsPath}?new=true`,
-                ),
-              );
+              dispatch(push(commentsPath));
             }}
           />
         </Box>

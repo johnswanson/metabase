@@ -48,7 +48,7 @@ export const CustomCodeBlock = CodeBlock.extend({
 
   addProseMirrorPlugins() {
     return [
-      createProseMirrorPlugin(CodeBlock.name),
+      createProseMirrorPlugin("codeBlock"),
       // this plugin creates a code block for pasted content from VS Code
       // we can also detect the copied code language
       //
@@ -152,7 +152,7 @@ export const CodeBlockNodeView = ({ node, editor, getPos }: NodeViewProps) => {
       {shouldShowMenus && document && (
         <CommentsMenu
           active={isOpen}
-          href={`/document/${document.id}/comments/${_id}`}
+          childTargetId={_id}
           ref={commentsRefs.setFloating}
           show={isOpen || hovered}
           style={commentsFloatingStyles}
