@@ -104,6 +104,7 @@
      collections
      config
      content-verification
+     contextual-interestingness
      custom-viz-plugin
      dashboards
      documents
@@ -116,6 +117,7 @@
      enterprise/transforms
      enterprise/transforms-inspector
      events
+     explorations
      formatter
      geojson
      initialization-status

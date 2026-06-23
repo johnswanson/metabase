@@ -922,6 +922,7 @@
                     :model/DashboardTab
                     :model/Dimension
                     :model/Document
+                    :model/Exploration
                     :model/Measure
                     :model/NativeQuerySnippet
                     :model/PermissionsGroup
