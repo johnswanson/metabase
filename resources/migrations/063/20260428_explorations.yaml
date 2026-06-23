@@ -1,0 +1,250 @@
+## Initial exploration related tables
+
+databaseChangeLog:
+  - changeSet:
+      id: v63.g43w3qr4
+      author: nvoxland
+      comment: Create exploration table
+      changes:
+        - createTable:
+            tableName: exploration
+            remarks: A user-created data investigation, e.g. "why is revenue down".
+            columns:
+              - column:
+                  name: id
+                  type: int
+                  autoIncrement: true
+                  remarks: Primary key
+                  constraints:
+                    primaryKey: true
+                    nullable: false
+              - column:
+                  name: name
+                  type: ${text.type}
+                  remarks: Human-readable name for the exploration
+                  constraints:
+                    nullable: false
+              - column:
+                  name: description
+                  type: ${text.type}
+                  remarks: Optional longer description of what is being investigated
+                  constraints:
+                    nullable: true
+              - column:
+                  name: creator_id
+                  type: int
+                  remarks: User who created the exploration; owns it for permissions
+                  constraints:
+                    nullable: false
+              - column:
+                  name: collection_id
+                  type: int
+                  remarks: Collection this exploration lives in. NULL means the root collection ("Our Analytics"). New explorations default to their creator's Personal Collection.
+                  constraints:
+                    nullable: true
+              - column:
+                  name: archived
+                  type: ${boolean.type}
+                  defaultValueBoolean: false
+                  remarks: Whether the exploration has been archived
+                  constraints:
+                    nullable: false
+              - column:
+                  name: archived_directly
+                  type: ${boolean.type}
+                  defaultValueBoolean: false
+                  remarks: True when the user archived this exploration itself; false when it became archived because a parent collection was archived
+                  constraints:
+                    nullable: false
+              - column:
+                  name: collection_position
+                  type: int
+                  remarks: Ordering of pinned items within a collection; null = not pinned
+                  constraints:
+                    nullable: true
+              - column:
+                  name: entity_id
+                  type: char(21)
+                  remarks: NanoID for serdes
+                  constraints:
+                    nullable: false
+                    unique: true
+              - column:
+                  name: created_at
+                  type: ${timestamp_type}
+                  defaultValueComputed: current_timestamp
+                  remarks: When the exploration was created
+                  constraints:
+                    nullable: false
+              - column:
+                  name: updated_at
+                  type: ${timestamp_type}
+                  defaultValueComputed: current_timestamp
+                  remarks: When the exploration was last updated
+                  constraints:
+                    nullable: false
+
+  - changeSet:
+      id: v63.92fasdf
+      author: nvoxland
+      comment: Index on exploration.creator_id
+      changes:
+        - createIndex:
+            tableName: exploration
+            indexName: idx_exploration_creator_id
+            columns:
+              - column:
+                  name: creator_id
+
+  - changeSet:
+      id: v63.g442xf
+      author: nvoxland
+      comment: FK exploration.creator_id -> core_user.id
+      changes:
+        - addForeignKeyConstraint:
+            baseTableName: exploration
+            baseColumnNames: creator_id
+            referencedTableName: core_user
+            referencedColumnNames: id
+            constraintName: fk_exploration_creator_id
+            onDelete: CASCADE
+
+  - changeSet:
+      id: v63.expcollidx
+      author: jdswanson
+      comment: Index on exploration.collection_id
+      changes:
+        - createIndex:
+            tableName: exploration
+            indexName: idx_exploration_collection_id
+            columns:
+              - column:
+                  name: collection_id
+
+  - changeSet:
+      id: v63.expcollfk
+      author: jdswanson
+      comment: FK exploration.collection_id -> collection.id
+      changes:
+        - addForeignKeyConstraint:
+            baseTableName: exploration
+            baseColumnNames: collection_id
+            referencedTableName: collection
+            referencedColumnNames: id
+            constraintName: fk_exploration_collection_id
+            onDelete: SET NULL
+
+  - changeSet:
+      id: v63.bnweradf
+      author: nvoxland
+      comment: Create exploration_thread table
+      changes:
+        - createTable:
+            tableName: exploration_thread
+            remarks: A hypothesis / iteration within an exploration.
+            columns:
+              - column:
+                  name: id
+                  type: int
+                  autoIncrement: true
+                  remarks: Primary key
+                  constraints:
+                    primaryKey: true
+                    nullable: false
+              - column:
+                  name: exploration_id
+                  type: int
+                  remarks: The exploration this thread belongs to
+                  constraints:
+                    nullable: false
+              - column:
+                  name: name
+                  type: ${text.type}
+                  remarks: Optional name for the thread / hypothesis
+                  constraints:
+                    nullable: true
+              - column:
+                  name: prompt
+                  type: ${text.type}
+                  remarks: Natural-language prompt the user typed for this thread
+                  constraints:
+                    nullable: true
+              - column:
+                  name: position
+                  type: int
+                  defaultValueNumeric: 0
+                  remarks: Ordering of threads within an exploration
+                  constraints:
+                    nullable: false
+              - column:
+                  name: started_at
+                  type: ${timestamp_type}
+                  remarks: Set when the user clicks "Start exploration"; null means draft
+                  constraints:
+                    nullable: true
+              - column:
+                  name: entity_id
+                  type: char(21)
+                  remarks: NanoID for serdes
+                  constraints:
+                    nullable: false
+                    unique: true
+              - column:
+                  name: created_at
+                  type: ${timestamp_type}
+                  defaultValueComputed: current_timestamp
+                  remarks: When the thread was created
+                  constraints:
+                    nullable: false
+              - column:
+                  name: updated_at
+                  type: ${timestamp_type}
+                  defaultValueComputed: current_timestamp
+                  remarks: When the thread was last updated
+                  constraints:
+                    nullable: false
+
+  - changeSet:
+      id: v63.g89asrdg
+      author: nvoxland
+      comment: Index on exploration_thread.exploration_id
+      changes:
+        - createIndex:
+            tableName: exploration_thread
+            indexName: idx_exploration_thread_exploration_id
+            columns:
+              - column:
+                  name: exploration_id
+
+  - changeSet:
+      id: v63.gpores
+      author: nvoxland
+      comment: FK exploration_thread.exploration_id -> exploration.id
+      changes:
+        - addForeignKeyConstraint:
+            baseTableName: exploration_thread
+            baseColumnNames: exploration_id
+            referencedTableName: exploration
+            referencedColumnNames: id
+            constraintName: fk_exploration_thread_exploration_id
+            onDelete: CASCADE
+
+  - changeSet:
+      id: v63.expeidnull
+      author: nvoxland
+      comment: Make exploration.entity_id nullable so serdes drop-entity-ids! can NULL it
+      changes:
+        - dropNotNullConstraint:
+            tableName: exploration
+            columnName: entity_id
+            columnDataType: char(21)
+
+  - changeSet:
+      id: v63.expthreadeidnull
+      author: nvoxland
+      comment: Make exploration_thread.entity_id nullable so serdes drop-entity-ids! can NULL it
+      changes:
+        - dropNotNullConstraint:
+            tableName: exploration_thread
+            columnName: entity_id
+            columnDataType: char(21)
