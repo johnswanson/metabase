@@ -29,7 +29,7 @@ export const CustomBlockquote = Blockquote.extend({
   },
 
   addProseMirrorPlugins() {
-    return [createProseMirrorPlugin(Blockquote.name)];
+    return [createProseMirrorPlugin("blockquote")];
   },
 });
 
@@ -66,7 +66,7 @@ export const BlockquoteNodeView = ({ node, editor, getPos }: NodeViewProps) => {
       {shouldShowMenus && document && (
         <CommentsMenu
           active={isOpen}
-          href={`/document/${document.id}/comments/${_id}`}
+          childTargetId={_id}
           ref={commentsRefs.setFloating}
           show={isOpen || hovered}
           style={commentsFloatingStyles}
