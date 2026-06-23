@@ -108,7 +108,7 @@
                        entity-id-where
                        (conj entity-id-where)
 
-                       (and (not scope-key) (seq other-conditions))
+                       (seq other-conditions)
                        (into (for [[k v] (partition 2 other-conditions)]
                                [:= k v])))
           where-clause (when (seq conditions)
