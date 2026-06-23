@@ -685,3 +685,238 @@ databaseChangeLog:
                   remarks: EDN-encoded transcript of the LLM exchange (prompt + responses + validation errors + final plan) used to materialize this thread's exploration_query rows. Debug-only — not surfaced to the user.
                   constraints:
                     nullable: true
+
+  - changeSet:
+      id: v63.storedresult
+      author: nvoxland
+      comment: Create stored_result table
+      changes:
+        - createTable:
+            tableName: stored_result
+            remarks: Cached query result snapshots referenced by static `cardEmbed` nodes in documents. Decoupled from any one feature so future tools can write static charts without going through explorations.
+            columns:
+              - column:
+                  name: id
+                  type: int
+                  autoIncrement: true
+                  remarks: Primary key
+                  constraints:
+                    primaryKey: true
+                    nullable: false
+              - column:
+                  name: result_data
+                  type: ${blob.type}
+                  remarks: gzipped+nippy serialized query result bytes
+                  constraints:
+                    nullable: false
+              - column:
+                  name: creator_id
+                  type: int
+                  remarks: User who produced this snapshot. Used for the can-read? bypass and for the data-permission gate (sandboxing/impersonation) applied to non-creator readers.
+                  constraints:
+                    nullable: true
+              - column:
+                  name: database_id
+                  type: int
+                  remarks: Database the snapshot was produced against. Used by the data-permission gate without needing to parse `dataset_query`. NULL when the snapshot isn't tied to a database (e.g. a synthetic chart).
+                  constraints:
+                    nullable: true
+              - column:
+                  name: dataset_query
+                  type: ${text.type}
+                  remarks: JSON-encoded MBQL/native query that produced this snapshot.
+                  constraints:
+                    nullable: true
+              - column:
+                  name: created_at
+                  type: ${timestamp_type}
+                  defaultValueComputed: current_timestamp
+                  remarks: When the snapshot was written
+                  constraints:
+                    nullable: false
+              - column:
+                  name: updated_at
+                  type: ${timestamp_type}
+                  defaultValueComputed: current_timestamp
+                  remarks: When the snapshot was last updated
+                  constraints:
+                    nullable: false
+
+  - changeSet:
+      id: v63.storedresultcreatoridx
+      author: nvoxland
+      comment: Index on stored_result.creator_id
+      changes:
+        - createIndex:
+            tableName: stored_result
+            indexName: idx_stored_result_creator_id
+            columns:
+              - column:
+                  name: creator_id
+
+  - changeSet:
+      id: v63.storedresultcreatorfk
+      author: nvoxland
+      comment: FK stored_result.creator_id -> core_user.id
+      changes:
+        - addForeignKeyConstraint:
+            baseTableName: stored_result
+            baseColumnNames: creator_id
+            referencedTableName: core_user
+            referencedColumnNames: id
+            constraintName: fk_stored_result_creator_id
+            onDelete: SET NULL
+
+  - changeSet:
+      id: v63.sruse
+      author: nvoxland
+      comment: Create stored_result_use table tracking what references a stored_result
+      changes:
+        - createTable:
+            tableName: stored_result_use
+            remarks: Records each reference to a stored_result snapshot.
+            columns:
+              - column:
+                  name: id
+                  type: int
+                  autoIncrement: true
+                  remarks: Primary key
+                  constraints:
+                    primaryKey: true
+                    nullable: false
+              - column:
+                  name: stored_result_id
+                  type: int
+                  remarks: The cached snapshot this row references
+                  constraints:
+                    nullable: false
+              - column:
+                  name: card_id
+                  type: int
+                  remarks: The referencing Card
+                  constraints:
+                    nullable: true
+              - column:
+                  name: exploration_id
+                  type: int
+                  remarks: The referencing exploration
+                  constraints:
+                    nullable: true
+              - column:
+                  name: created_at
+                  type: ${timestamp_type}
+                  defaultValueComputed: current_timestamp
+                  remarks: When the reference was recorded
+                  constraints:
+                    nullable: false
+              - column:
+                  name: updated_at
+                  type: ${timestamp_type}
+                  defaultValueComputed: current_timestamp
+                  remarks: When the reference row was last updated
+                  constraints:
+                    nullable: false
+
+  - changeSet:
+      id: v63.srusesridx
+      author: nvoxland
+      comment: Index on stored_result_use.stored_result_id
+      changes:
+        - createIndex:
+            tableName: stored_result_use
+            indexName: idx_stored_result_use_stored_result_id
+            columns:
+              - column:
+                  name: stored_result_id
+
+  - changeSet:
+      id: v63.srusesrfk
+      author: nvoxland
+      comment: FK stored_result_use.stored_result_id -> stored_result.id
+      changes:
+        - addForeignKeyConstraint:
+            baseTableName: stored_result_use
+            baseColumnNames: stored_result_id
+            referencedTableName: stored_result
+            referencedColumnNames: id
+            constraintName: fk_stored_result_use_stored_result_id
+            onDelete: CASCADE
+
+  - changeSet:
+      id: v63.srusecardidx
+      author: nvoxland
+      comment: Index on stored_result_use.card_id
+      changes:
+        - createIndex:
+            tableName: stored_result_use
+            indexName: idx_stored_result_use_card_id
+            columns:
+              - column:
+                  name: card_id
+
+  - changeSet:
+      id: v63.srusecardfk
+      author: nvoxland
+      comment: FK stored_result_use.card_id -> report_card.id
+      changes:
+        - addForeignKeyConstraint:
+            baseTableName: stored_result_use
+            baseColumnNames: card_id
+            referencedTableName: report_card
+            referencedColumnNames: id
+            constraintName: fk_stored_result_use_card_id
+            onDelete: CASCADE
+
+  - changeSet:
+      id: v63.sruseexplidx
+      author: nvoxland
+      comment: Index on stored_result_use.exploration_id
+      changes:
+        - createIndex:
+            tableName: stored_result_use
+            indexName: idx_stored_result_use_exploration_id
+            columns:
+              - column:
+                  name: exploration_id
+
+  - changeSet:
+      id: v63.sruseexplfk
+      author: nvoxland
+      comment: FK stored_result_use.exploration_id -> exploration.id
+      changes:
+        - addForeignKeyConstraint:
+            baseTableName: stored_result_use
+            baseColumnNames: exploration_id
+            referencedTableName: exploration
+            referencedColumnNames: id
+            constraintName: fk_stored_result_use_exploration_id
+            onDelete: CASCADE
+
+  - changeSet:
+      id: v63.storedresultdataaccesstoken
+      author: johnswanson
+      comment: Add stored_result.data_access_token for per-lens cached-read gating
+      changes:
+        - addColumn:
+            tableName: stored_result
+            columns:
+              - column:
+                  name: data_access_token
+                  type: ${text.type}
+                  remarks: JSON-encoded effective-data-access token (sandbox/impersonation/routing fingerprint) for the creator's lens this snapshot was computed under. Compared against a viewer's token to gate cached reads. NULL means creator+admin only.
+                  constraints:
+                    nullable: true
+
+  - changeSet:
+      id: v63.storedresultdataaccesstokenbf
+      author: johnswanson
+      comment: Backfill data_access_token to the empty-map EDN sentinel '{}' for pre-token stored_result rows so legacy snapshots stay viewable by anyone with sufficient data perms (the nil-token read gate is creator+admin-only).
+      changes:
+        - update:
+            tableName: stored_result
+            columns:
+              - column:
+                  name: data_access_token
+                  value: "{}"
+            where: data_access_token IS NULL
+      rollback:

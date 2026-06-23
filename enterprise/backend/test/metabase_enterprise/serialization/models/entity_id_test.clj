@@ -61,6 +61,8 @@
     :model/ExplorationQuery
     :model/ExplorationThread
     :model/ExplorationThreadGroup
+    :model/StoredResult
+    :model/StoredResultUse
     :model/CollectionPermissionGraphRevision
     :model/DashboardCardSeries
     :model/LoginHistory

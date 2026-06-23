@@ -1760,7 +1760,9 @@
    :model-exports #{:model/Card
                     :model/Query
                     :model/QueryExecution
-                    :model/QueryTable}
+                    :model/QueryTable
+                    :model/StoredResult
+                    :model/StoredResultUse}
    :model-imports #{:model/Action
                     :model/CardBookmark
                     :model/Collection
@@ -1836,6 +1838,7 @@
               metabase.query-processor.init
               metabase.query-processor.interface
               metabase.query-processor.metadata
+              metabase.query-processor.middleware.cache.impl
               metabase.query-processor.middleware.constraints
               metabase.query-processor.middleware.enterprise
               metabase.query-processor.middleware.permissions
