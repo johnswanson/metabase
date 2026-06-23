@@ -1,6 +1,7 @@
 (ns metabase.explorations.init
   (:require
    [metabase.documents.core :as documents]
+   [metabase.explorations.ai-summary]
    [metabase.explorations.document-perms :as document-perms]
    [metabase.explorations.models.exploration]
    [metabase.explorations.models.exploration-query]
