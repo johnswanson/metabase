@@ -23,6 +23,7 @@
    [metabase.explorations.query-plan.context :as qp.context]
    [metabase.explorations.query-plan.variants :as qp.variants]
    [metabase.explorations.settings :as explorations.settings]
+   [metabase.explorations.timeline-interestingness :as explorations.timeline-interestingness]
    [metabase.interestingness.core :as interestingness]
    [metabase.lib.core :as lib]
    [metabase.permissions.core :as perms]
@@ -411,12 +412,128 @@
     (canceled-mid-plan-cleanup! thread-id)
     :worked))
 
+(def ^:private ^:const stale-claim-cutoff-minutes
+  "How long after a claim row's `created_at` we treat it as stale and reclaimable. Bounded above
+  by metabot.self's retry budget for a single LLM call (~60s worst case), so a still-alive worker
+  will never be stale-reclaimed. Five minutes gives plenty of headroom."
+  5)
+
+(defn- stale-cutoff
+  "Cutoff `OffsetDateTime`: claim rows with `created_at` older than this and `scored_at` still
+  `NULL` are eligible for stale-reclaim."
+  ^OffsetDateTime []
+  (.minusMinutes (OffsetDateTime/now) stale-claim-cutoff-minutes))
+
+(defn- find-unscored-pair
+  "Return one `{:exploration_query_id _ :timeline_id _ :stale_id _}` map for a `(query, timeline)`
+  pair that needs scoring. A pair is eligible if the query is `done`, the timeline is selected on
+  the same thread, and either:
+   - no claim row exists yet (`:stale_id` is nil → fresh INSERT), or
+   - a claim row exists with `scored_at` still NULL and `created_at` older than
+     [[stale-claim-cutoff-minutes]] (`:stale_id` is the row id → reclaim via CAS UPDATE).
+  Returns nil when there's no pending work."
+  []
+  (first
+   (t2/query
+    {:select    [[:q.id :exploration_query_id]
+                 [:ett.timeline_id :timeline_id]
+                 [:s.id :stale_id]]
+     :from      [[:exploration_query :q]]
+     :join      [[:exploration_thread :et]
+                 [:= :et.id :q.exploration_thread_id]
+                 [:exploration_thread_timeline :ett]
+                 [:= :ett.exploration_thread_id :q.exploration_thread_id]]
+     :left-join [[:exploration_query_timeline_interestingness :s]
+                 [:and [:= :s.exploration_query_id :q.id]
+                  [:= :s.timeline_id :ett.timeline_id]]]
+     :where     [:and [:= :q.status "done"]
+                 [:= :et.canceled_at nil]
+                 [:or [:= :s.id nil]
+                  [:and [:= :s.scored_at nil]
+                   [:< :s.created_at (stale-cutoff)]]]]
+     :order-by  [[:q.id :asc] [:ett.timeline_id :asc]]
+     :limit     1})))
+
+(defn- reclaim-stale-timeline-pair!
+  "CAS-bump `created_at` on an existing claim row whose `scored_at` is still NULL and `created_at`
+  is older than the cutoff. Returns the claim shape on success, nil if another worker won the
+  reclaim race."
+  [exploration_query_id timeline_id stale_id]
+  (when (pos? (t2/update! :model/ExplorationQueryTimelineInterestingness
+                          :id         stale_id
+                          :scored_at  nil
+                          :created_at [:< (stale-cutoff)]
+                          {:created_at (OffsetDateTime/now)}))
+    (log/infof "Stale-reclaimed timeline pair (q=%s, t=%s, id=%s)"
+               exploration_query_id timeline_id stale_id)
+    {:id                   stale_id
+     :exploration_query_id exploration_query_id
+     :timeline_id          timeline_id}))
+
+(defn- insert-fresh-timeline-pair!
+  "INSERT a fresh claim row with `scored_at=NULL`; the unique constraint serializes competing
+  INSERTs. Returns the claim shape on success, nil on conflict (the loser of the race)."
+  [exploration_query_id timeline_id]
+  (try
+    (when-let [row (first (t2/insert-returning-instances!
+                           :model/ExplorationQueryTimelineInterestingness
+                           {:exploration_query_id exploration_query_id
+                            :timeline_id          timeline_id}))]
+      {:id                   (:id row)
+       :exploration_query_id exploration_query_id
+       :timeline_id          timeline_id})
+    (catch Throwable e
+      (log/tracef e "Lost race claiming timeline pair (q=%s, t=%s)"
+                  exploration_query_id timeline_id)
+      nil)))
+
+(defn- claim-pending-timeline-pair!
+  "Reserve one `(query, timeline)` pair. Dispatches to [[reclaim-stale-timeline-pair!]] when
+  there's an existing stale claim row, otherwise to [[insert-fresh-timeline-pair!]]. Returns
+  the claim shape on success, nil on race loss / no work."
+  []
+  (when-let [pair (find-unscored-pair)]
+    (let [{:keys [exploration_query_id timeline_id stale_id]} pair]
+      (if stale_id
+        (reclaim-stale-timeline-pair! exploration_query_id timeline_id stale_id)
+        (insert-fresh-timeline-pair! exploration_query_id timeline_id)))))
+
+(defn- run-one-timeline-iteration!
+  "Try to claim and score one `(query, timeline)` pair. The scorer's own try/catch (in
+  [[explorations.timeline-interestingness/score-query-timeline]]) already returns nil on failure
+  paths, but we wrap the call here too so a poison input that escapes still produces a sentinel
+  row with `score=NULL, scored_at=NOW()` instead of leaving the claim row stuck. Returns truthy
+  when work was done.
+
+  Runs the scorer inside a `request/with-current-user creator-id` binding (same as the contextual
+  scorer in [[safe-score+describe]]) so the scorer's metabot permission / usage-limit gate resolves
+  against the exploration's creator. A nil creator (deleted exploration) leaves the score nil."
+  []
+  (when-let [{:keys [id exploration_query_id timeline_id]} (claim-pending-timeline-pair!)]
+    (let [eq         (t2/select-one [:model/ExplorationQuery :exploration_thread_id]
+                                    :id exploration_query_id)
+          creator-id (when eq (exploration-creator-id eq))
+          score      (try
+                       (when creator-id
+                         (request/with-current-user creator-id
+                           (explorations.timeline-interestingness/score-query-timeline
+                            exploration_query_id timeline_id)))
+                       (catch Throwable e
+                         (log/warnf e "Timeline scoring failed for query=%s timeline=%s"
+                                    exploration_query_id timeline_id)
+                         nil))]
+      (t2/update! :model/ExplorationQueryTimelineInterestingness id
+                  {:interestingness_score score
+                   :scored_at             (OffsetDateTime/now)}))
+    :worked))
+
 (defn- run-one-iteration!
   "Do one unit of work: plan any unplanned threads first, then execute pending
-  queries. Returns truthy when something was processed."
+  queries, then score (query, timeline) pairs. Returns truthy when something was processed."
   []
   (or (run-one-plan-iteration!)
-      (run-one-query-iteration!)))
+      (run-one-query-iteration!)
+      (run-one-timeline-iteration!)))
 
 (defn- worker-loop
   [worker-id]

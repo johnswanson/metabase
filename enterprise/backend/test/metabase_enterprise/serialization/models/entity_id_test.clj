@@ -60,6 +60,7 @@
     :model/Exploration
     :model/ExplorationQuery
     :model/ExplorationQueryResult
+    :model/ExplorationQueryTimelineInterestingness
     :model/ExplorationThread
     :model/ExplorationThreadGroup
     :model/ExplorationThreadTimeline
