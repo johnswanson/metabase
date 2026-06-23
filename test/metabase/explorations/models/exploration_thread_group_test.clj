@@ -34,3 +34,17 @@
       (mt/with-current-user (:id owner)
         (is (true? (mi/can-read?  :model/ExplorationThreadGroup (:id g))))
         (is (true? (mi/can-write? :model/ExplorationThreadGroup (:id g))))))))
+
+(deftest exploration-query-group-id-roundtrip-test
+  (testing "exploration_query persists and reads back group_id"
+    (mt/with-temp [:model/User u {}
+                   :model/Card metric {:type :metric :creator_id (:id u)}
+                   :model/Exploration e {:name "x" :creator_id (:id u)}
+                   :model/ExplorationThread t {:exploration_id (:id e)}
+                   :model/ExplorationThreadGroup g {:exploration_thread_id (:id t)}
+                   :model/ExplorationQuery q {:exploration_thread_id (:id t)
+                                              :card_id (:id metric)
+                                              :dimension_id "d1"
+                                              :group_id (:id g)
+                                              :dataset_query {:database 1 :type :query}}]
+      (is (= (:id g) (:group_id (t2/select-one [:model/ExplorationQuery :group_id] :id (:id q))))))))
