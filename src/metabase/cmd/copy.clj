@@ -141,7 +141,8 @@
     :model/MetabotPrompt
     ;; 62+
     :model/Exploration
-    :model/ExplorationThread]
+    :model/ExplorationThread
+    :model/ExplorationThreadGroup]
    (when config/ee-available?
      [:model/MetabotPermissions
       :model/MetabotGroupLimit
