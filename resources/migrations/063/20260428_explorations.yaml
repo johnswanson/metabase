@@ -1324,3 +1324,57 @@ databaseChangeLog:
             referencedColumnNames: id
             constraintName: fk_eqti_timeline_id
             onDelete: CASCADE
+
+  - changeSet:
+      id: v63.62346w
+      author: nvoxland
+      comment: Add document.exploration_thread_id
+      changes:
+        - addColumn:
+            tableName: document
+            columns:
+              - column:
+                  name: exploration_thread_id
+                  type: int
+                  remarks: Optional owning exploration thread
+                  constraints:
+                    nullable: true
+
+  - changeSet:
+      id: v63.64fsvsd
+      author: nvoxland
+      comment: Index on document.exploration_thread_id
+      changes:
+        - createIndex:
+            tableName: document
+            indexName: idx_document_exploration_thread_id
+            columns:
+              - column:
+                  name: exploration_thread_id
+
+  - changeSet:
+      id: v63.g43sdfg
+      author: nvoxland
+      comment: FK document.exploration_thread_id -> exploration_thread.id
+      changes:
+        - addForeignKeyConstraint:
+            baseTableName: document
+            baseColumnNames: exploration_thread_id
+            referencedTableName: exploration_thread
+            referencedColumnNames: id
+            constraintName: fk_document_exploration_thread_id
+            onDelete: CASCADE
+
+  - changeSet:
+      id: v63.7gjeaasdg
+      author: nvoxland
+      comment: Backfill an empty Findings document per exploration_thread
+      changes:
+        - sql:
+            sql: >-
+              INSERT INTO document (name, document, content_type, creator_id, exploration_thread_id)
+              SELECT 'Findings', '{"type":"doc","content":[]}', 'application/json+vnd.prose-mirror', e.creator_id, t.id
+              FROM exploration_thread t
+              JOIN exploration e ON e.id = t.exploration_id
+              WHERE NOT EXISTS (SELECT 1 FROM document d WHERE d.exploration_thread_id = t.id)
+      rollback:

@@ -629,6 +629,7 @@
                     :model/Collection
                     :model/Dashboard
                     :model/Document
+                    :model/Exploration
                     :model/NativeQuerySnippet
                     :model/Pulse
                     :model/Table
