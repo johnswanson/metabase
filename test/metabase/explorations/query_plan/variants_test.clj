@@ -27,6 +27,24 @@
    :effective_type :type/Text
    :semantic_type  :type/Category})
 
+(defn- run-top-n-other [{:keys [card-id k]}]
+  (let [ctx {:mp      (mt/metadata-provider)
+             :card    (products-count-card card-id)
+             :target  (category-target)
+             :dim     category-dim
+             :segment nil
+             :params  {:k k}}
+        q   (variants/dataset-query "top-n-other" ctx)]
+    ;; The query orders by metric desc; `pin-other-last` (run by the runner on
+    ;; the QP result) moves `(Other)` to the end. Mirror that here so the test
+    ;; exercises the same effective ordering the chart sees.
+    ;; Coerce the count column to `long`: some drivers (e.g. Oracle) return
+    ;; aggregate counts as BigDecimal, which would break exact `=` comparison
+    ;; against the expected Long literals even though the ordering is identical.
+    (->> (variants/pin-other-last "top-n-other" (qp/process-query q))
+         :data :rows
+         (mapv (fn [[label cnt]] [label (long cnt)])))))
+
 ;; ---------------------------------------------------------------------------
 ;; Temporal-axis variants: order by date desc + not-null filter + row cap
 ;; ---------------------------------------------------------------------------
@@ -148,10 +166,39 @@
                (-> (qp/process-query (variants/dataset-query "time-facet" ctx))
                    :data :rows vec)))))))
 
-;; NOTE: per-value-time-series-cap-test and top-n-other-row-order-test (the two
-;; two-phase "discovery" variants) are deferred in this split — their internal
-;; discovery query returns nil in isolation here; re-verified at the stack tip /
-;; once the runner exercises planning end-to-end.
+(deftest per-value-time-series-cap-test
+  (testing "per-value-time-series carries a date-desc row cap (it previously had none)"
+    (let [ctx {:mp      (mt/metadata-provider)
+               :card    (orders-count-by-month-card 9000006)
+               :target  (orders-category-target)
+               :dim     category-dim
+               :segment nil
+               :params  {:k 1 :value_index 0}}
+          q   (variants/dataset-query "per-value-time-series" ctx)]
+      ;; Discovery resolves value 0 to the top category by count: Widget.
+      (is (= ["Category is Widget"]
+             (clause-names q (lib/filters q))))
+      (is (= ["Created At: Month descending" "Count descending"]
+             (clause-names q (lib/order-bys q))))
+      (with-redefs [variants/default-max-rows 3]
+        (is (= [["2020-04-01T00:00:00Z" 100]
+                ["2020-03-01T00:00:00Z" 129]
+                ["2020-02-01T00:00:00Z" 158]]
+               (-> (qp/process-query (variants/dataset-query "per-value-time-series" ctx))
+                   :data :rows vec)))))))
+
+(deftest top-n-other-row-order-test
+  (mt/test-drivers (mt/normal-drivers)
+    (testing "top-n-other sorts non-Other rows by metric desc and pins (Other) last,
+              even when (Other) has the largest metric value."
+      ;; Sample PRODUCTS counts: Widget 54, Gadget 53, Gizmo 51, Doohickey 42.
+      ;; With k=2 the top buckets are Widget/Gadget; (Other) rollup = Gizmo+Doohickey = 93.
+      (is (= [["Widget" 54] ["Gadget" 53] ["(Other)" 93]]
+             (run-top-n-other {:card-id 9000001 :k 2}))))
+    (testing "when k >= distinct dim values, no (Other) row appears — just the dim values
+              sorted by metric desc."
+      (is (= [["Widget" 54] ["Gadget" 53] ["Gizmo" 51] ["Doohickey" 42]]
+             (run-top-n-other {:card-id 9000002 :k 4}))))))
 
 (deftest pin-other-last-test
   (testing "pin-other-last stably moves the (Other) row to the end, preserving the
