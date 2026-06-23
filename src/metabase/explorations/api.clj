@@ -9,10 +9,17 @@
    [metabase.events.core :as events]
    [metabase.explorations.core :as explorations]
    [metabase.explorations.models.exploration :as expl.model]
+   [metabase.explorations.models.exploration-query-result :as eqr]
+   [metabase.queries.core :as queries]
+   [metabase.query-processor.middleware.cache.impl :as cache.impl]
+   [metabase.query-processor.pipeline :as qp.pipeline]
+   [metabase.query-processor.streaming :as qp.streaming]
    [metabase.request.core :as request]
    [metabase.util.malli.registry :as mr]
    [metabase.util.malli.schema :as ms]
-   [toucan2.core :as t2]))
+   [toucan2.core :as t2])
+  (:import
+   (java.io ByteArrayInputStream)))
 
 (set! *warn-on-reflection* true)
 
@@ -20,6 +27,12 @@
 
 (defn- get-exploration-or-404 [id]
   (api/check-404 (t2/select-one :model/Exploration :id id)))
+
+(defn- get-exploration-query-or-404
+  "Fetch an `ExplorationQuery` by id and read-check it. The model's `can-read?` delegates up
+  through `ExplorationThread` to the parent `Exploration`."
+  [query-id]
+  (api/read-check (api/check-404 (t2/select-one :model/ExplorationQuery :id query-id))))
 
 (defn- check-destination-collection-perms!
   "When `updates` moves the exploration to a different `collection_id`, verify the current
@@ -128,6 +141,20 @@
    [:status                :string]
    [:error_message         {:optional true} [:maybe :string]]
    [:entity_id             {:optional true} [:maybe :string]]])
+
+(mr/def ::ExplorationQueryStreamResponse
+  "Schema for `GET /query/:id`. On success the body is a streamed dataset (api/csv/json/xlsx),
+   so we describe it as `:any`. On a not-yet-done query we return a 409 with a status payload."
+  [:or
+   :any
+   [:map
+    [:status [:= 409]]
+    [:body   [:map
+              [:id            ms/PositiveInt]
+              [:status        :string]
+              [:error_message {:optional true} [:maybe :string]]
+              [:started_at    {:optional true} [:maybe :any]]
+              [:finished_at   {:optional true} [:maybe :any]]]]]])
 
 (def ^:private MetricSelection
   [:map
@@ -302,6 +329,48 @@
                           [:= :exploration_query.exploration_thread_id :exploration_thread.id]]
               :where     [:= :exploration_thread.exploration_id id]
               :order-by  [[:exploration_query.position :asc] [:exploration_query.id :asc]]}))
+
+(defn- stream-stored-result
+  "Replay a worker-serialized QP result (gzipped+nippy bytes from `:model/StoredResult.result_data`)
+  through the streaming pipeline so the response is shaped like a normal `/api/dataset` response.
+  Reuses
+  `cache.impl/with-reducible-deserialized-results` — the same machinery the cache middleware
+  uses to replay cached results."
+  [export-format ^bytes result-bytes]
+  (qp.streaming/streaming-response [rff export-format]
+    (cache.impl/with-reducible-deserialized-results
+      [[qp-result _] (ByteArrayInputStream. result-bytes)]
+      (when qp-result
+        (let [data (:data qp-result)]
+          (qp.pipeline/*reduce* rff
+                                (dissoc data :rows)
+                                (or (:rows data) [])))))))
+
+(api.macros/defendpoint :get "/query/:id" :- ::ExplorationQueryStreamResponse
+  "Stream the result of a single completed exploration query. The optional `format` query param
+  is one of `api`, `json`, `csv`, `xlsx` (default `api`). When the underlying query is still
+  pending or has errored, returns a 409 with status info instead of streaming."
+  [{:keys [id]}     :- [:map [:id ms/PositiveInt]]
+   {:keys [format]} :- [:map
+                        [:format {:default :api}
+                         [:enum {:decode/api keyword} :api :csv :json :xlsx]]]]
+  (let [q (get-exploration-query-or-404 id)]
+    (case (:status q)
+      "done"
+      (let [sr (api/check-404 (eqr/stored-results id))]
+        ;; The cached `result_data` was produced under the creator's lens, so a non-creator viewer
+        ;; might otherwise see rows the QP would have filtered out for them. Gate against the
+        ;; creator's stored data-access token (sandbox/impersonation/routing) + basic data perms.
+        (when-not (= api/*current-user-id* (:creator_id sr))
+          (queries/assert-can-view-cached-result! sr))
+        (stream-stored-result format (:result_data sr)))
+
+      ;; Pending / errored: no blob exists yet and the response is status-only (no rows, no
+      ;; derived text), so it carries no data to leak — it rides the exploration's collection
+      ;; perms (already enforced by `get-exploration-query-or-404`'s read-check), like seeing a
+      ;; dashboard card that's still loading.
+      {:status 409
+       :body   (select-keys q [:id :status :error_message :started_at :finished_at])})))
 
 (api.macros/defendpoint :put "/:id" :- ::HydratedExploration
   "Update an exploration's metadata, archive state, or move it to a different collection."

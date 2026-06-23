@@ -920,3 +920,101 @@ databaseChangeLog:
                   value: "{}"
             where: data_access_token IS NULL
       rollback:
+
+
+  - changeSet:
+      id: v63.qrescreate
+      author: nvoxland
+      comment: Create exploration_query_result table
+      changes:
+        - createTable:
+            tableName: exploration_query_result
+            remarks: Per-exploration_query record pointing at the cached snapshot in stored_result plus the exploration-specific scoring metadata. Keyed 1:1 to exploration_query.
+            columns:
+              - column:
+                  name: id
+                  type: int
+                  autoIncrement: true
+                  remarks: Primary key
+                  constraints:
+                    primaryKey: true
+                    nullable: false
+              - column:
+                  name: exploration_query_id
+                  type: int
+                  remarks: The exploration_query this result belongs to
+                  constraints:
+                    nullable: false
+              - column:
+                  name: stored_result_id
+                  type: int
+                  remarks: FK to the cached snapshot in stored_result
+                  constraints:
+                    nullable: false
+              - column:
+                  name: created_at
+                  type: ${timestamp_type}
+                  defaultValueComputed: current_timestamp
+                  remarks: When the result was written
+                  constraints:
+                    nullable: false
+              - column:
+                  name: interestingness_score
+                  type: double
+                  remarks: Chart interestingness score in [0.0, 1.0]; null when the result can't be meaningfully scored (e.g. empty rows, no numeric measure).
+                  constraints:
+                    nullable: true
+              - column:
+                  name: contextual_interestingness_score
+                  type: double
+                  remarks: LLM-backed relevance score in [0.0, 1.0] for the chart vs. the thread prompt; null when the LLM is unconfigured, the prompt is blank, or the call failed.
+                  constraints:
+                    nullable: true
+
+  - changeSet:
+      id: v63.qresuq
+      author: nvoxland
+      comment: Unique constraint on exploration_query_result.exploration_query_id (1:1)
+      changes:
+        - addUniqueConstraint:
+            tableName: exploration_query_result
+            columnNames: exploration_query_id
+            constraintName: uq_exploration_query_result_query_id
+
+  - changeSet:
+      id: v63.qresfk
+      author: nvoxland
+      comment: FK exploration_query_result.exploration_query_id -> exploration_query.id
+      changes:
+        - addForeignKeyConstraint:
+            baseTableName: exploration_query_result
+            baseColumnNames: exploration_query_id
+            referencedTableName: exploration_query
+            referencedColumnNames: id
+            constraintName: fk_exploration_query_result_query_id
+            onDelete: CASCADE
+
+  - changeSet:
+      id: v63.qresstoredidx
+      author: nvoxland
+      comment: Index on exploration_query_result.stored_result_id
+      changes:
+        - createIndex:
+            tableName: exploration_query_result
+            indexName: idx_exploration_query_result_stored_result_id
+            columns:
+              - column:
+                  name: stored_result_id
+
+  - changeSet:
+      id: v63.qresstoredfk
+      author: nvoxland
+      comment: FK exploration_query_result.stored_result_id -> stored_result.id
+      changes:
+        - addForeignKeyConstraint:
+            baseTableName: exploration_query_result
+            baseColumnNames: stored_result_id
+            referencedTableName: stored_result
+            referencedColumnNames: id
+            constraintName: fk_exploration_query_result_stored_result_id
+            onDelete: CASCADE

@@ -86,6 +86,7 @@
    "DocumentBookmark"
    "Exploration"
    "ExplorationQuery"
+   "ExplorationQueryResult"
    "ExplorationThread"
    "ExplorationThreadGroup"
    "HTTPAction"
