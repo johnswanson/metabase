@@ -10,6 +10,7 @@
    [metabase.collections.models.collection :as collection]
    [metabase.documents.core :as documents]
    [metabase.events.core :as events]
+   [metabase.explorations.ai-summary :as ai-summary]
    [metabase.explorations.core :as explorations]
    [metabase.explorations.groups :as explorations.groups]
    [metabase.explorations.models.exploration :as expl.model]
@@ -176,7 +177,7 @@
       (update :threads #(some->> % attach-threads-read-data))))
 
 (defn- insert-thread-default-documents!
-  "Insert the default Scratchpad doc for a freshly-created thread."
+  "Insert the default Scratchpad doc, plus an AI-summary placeholder when configured."
   [thread-id coll-id]
   (t2/insert! :model/Document
               {:name                  default-document-name
@@ -184,7 +185,9 @@
                :content_type          documents/prose-mirror-content-type
                :creator_id            api/*current-user-id*
                :collection_id         coll-id
-               :exploration_thread_id thread-id}))
+               :exploration_thread_id thread-id})
+  (when (ai-summary/current-user-can-create-ai-summary?)
+    (ai-summary/create-placeholder-doc! thread-id api/*current-user-id* coll-id)))
 
 (defn- positional-rows
   "Stamp `:exploration_thread_id` and a 0-based `:position` onto each row in `rows`."
@@ -218,11 +221,15 @@
                  :exploration_id exploration-id
                  {:order-by [[:position :desc] [:id :desc]]}))
 
+(defn- reset-ai-summary-doc!
+  [thread-id]
+  (when-let [doc-id (t2/select-one-fn :ai_summary_document_id :model/ExplorationThread :id thread-id)]
+    (t2/update! :model/Document doc-id {:document (ai-summary/placeholder-pm-doc)})))
+
 (defn- reset-thread-for-rerun!
-  "Clear a thread's prior run so the background worker re-plans and re-executes it: drop its
-  ExplorationQuery rows and reset the plan/terminal state, re-stamping `started_at`."
   [thread-id]
   (t2/delete! :model/ExplorationQuery :exploration_thread_id thread-id)
+  (reset-ai-summary-doc! thread-id)
   (t2/update! :model/ExplorationThread thread-id
               {:started_at            (t/offset-date-time)
                :query_plan_started_at nil
@@ -336,6 +343,7 @@
    [:started_at                 {:optional true} [:maybe :any]]
    [:canceled_at                {:optional true} [:maybe :any]]
    [:completed_at               {:optional true} [:maybe :any]]
+   [:ai_summary_document_id     {:optional true} [:maybe ms/PositiveInt]]
    [:queries                    {:optional true} [:maybe [:sequential ::ExplorationQuerySummary]]]
    [:groups                     {:optional true} [:maybe [:sequential ::ExplorationQueryGroup]]]
    [:documents                  {:optional true} [:maybe [:sequential ::ExplorationDocument]]]
