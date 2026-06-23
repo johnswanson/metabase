@@ -990,6 +990,7 @@
   explorations
   {:team "UX West"
    :api  #{metabase.explorations.api
+           metabase.explorations.core
            metabase.explorations.init}
    :uses #{api
            app-db
