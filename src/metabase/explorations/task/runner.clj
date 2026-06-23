@@ -16,10 +16,12 @@
   (:require
    [medley.core :as m]
    [metabase.app-db.core :as mdb]
+   [metabase.explorations.interestingness :as explorations.interestingness]
    [metabase.explorations.query-plan :as explorations.query-plan]
    [metabase.explorations.query-plan.context :as qp.context]
    [metabase.explorations.query-plan.variants :as qp.variants]
    [metabase.explorations.settings :as explorations.settings]
+   [metabase.interestingness.core :as interestingness]
    [metabase.lib.core :as lib]
    [metabase.permissions.core :as perms]
    [metabase.query-permissions.core :as query-perms]
@@ -108,6 +110,50 @@
                     {:dataset_query dq :name nm})
         (assoc row :dataset_query dq :name nm)))))
 
+(defn- safe-chart-config
+  "Best-effort `qp-result->chart-config`. Returns nil on failure (>2 cols,
+  no numeric measure, unexpected shape, or any throw)."
+  [exploration-query qp-result]
+  (try
+    (explorations.interestingness/qp-result->chart-config exploration-query qp-result)
+    (catch Throwable e
+      (log/warnf e "Failed to build chart-config for ExplorationQuery %d" (:id exploration-query))
+      nil)))
+
+(defn- safe-deep-stats
+  "Best-effort deep `compute-chart-stats`. Returns nil on failure. Stored on
+  the result row so summarization, chart-detail UIs, and any other consumer
+  read the cached stats instead of re-running the pipeline against the
+  serialized result blob."
+  [exploration-query chart-config]
+  (when chart-config
+    (try
+      (interestingness/compute-chart-stats chart-config {:deep? true})
+      (catch Throwable e
+        (log/warnf e "Failed to compute chart stats for ExplorationQuery %d" (:id exploration-query))
+        nil))))
+
+(defn- safe-score
+  "Best-effort interestingness score. Reuses the pre-computed `stats` so we
+  don't run the stats pipeline twice. Logs and returns nil on any failure so
+  the worker still persists the result row — a scoring bug must never flip a
+  successful query to errored.
+
+  At `debug` level, logs the full statistical breakdown (non-degeneracy / signal /
+  structure sub-scores + chart-type) so the blended score isn't a black box when
+  diagnosing why a chart did or didn't earn the \"potentially interesting\" marker."
+  [exploration-query chart-config stats]
+  (try
+    (when (and chart-config stats)
+      (let [breakdown (interestingness/chart-interestingness chart-config stats)]
+        (log/debugf "Statistical interestingness for ExplorationQuery %d (thread %d): %s"
+                    (:id exploration-query) (:exploration_thread_id exploration-query) (pr-str breakdown))
+        (:score breakdown)))
+    (catch Throwable e
+      (log/warnf e "Failed to compute interestingness for ExplorationQuery %d"
+                 (:id exploration-query))
+      nil)))
+
 (defn- exploration-creator-id
   "Walk EQ → ExplorationThread → Exploration.creator_id for stamping onto the stored_result."
   [exploration-query]
@@ -137,9 +183,10 @@
       nil)))
 
 (defn- execute-and-persist-query-result!
-  "Run the QP on `row`'s `:dataset_query`, persist a `StoredResult` + `ExplorationQueryResult` +
-  `StoredResultUse`, and flip the `ExplorationQuery` to `done`. `started` is the `OffsetDateTime`
-  to stamp as the row's `:started_at`.
+  "Run the QP on `row`'s `:dataset_query`, compute the chart-config / stats / interestingness score
+  via the `safe-*` helpers, persist a `StoredResult` + `ExplorationQueryResult` + `StoredResultUse`,
+  and flip the `ExplorationQuery` to `done`. `started` is the `OffsetDateTime` to stamp as the row's
+  `:started_at`.
 
   The query runs as the exploration's creator, so the snapshot reflects the creator's own lens —
   sandboxing, connection impersonation, and database routing (all applied by the QP's own
@@ -161,6 +208,9 @@
                                       (run))
                                     (run))
         bytes        (serialize-result qp-result)
+        chart-config (safe-chart-config row qp-result)
+        stats        (safe-deep-stats row chart-config)
+        score        (safe-score row chart-config stats)
         sr-id        (first
                       (t2/insert-returning-pks!
                        :model/StoredResult
@@ -170,8 +220,10 @@
                         :dataset_query     (:dataset_query row)
                         :data_access_token token}))]
     (t2/insert! :model/ExplorationQueryResult
-                {:exploration_query_id (:id row)
-                 :stored_result_id     sr-id})
+                {:exploration_query_id  (:id row)
+                 :stored_result_id      sr-id
+                 :chart_stats           stats
+                 :interestingness_score score})
     ;; Record the (exploration -> stored_result) reference for lifecycle/GC tracking.
     (t2/insert! :model/StoredResultUse
                 {:stored_result_id sr-id
