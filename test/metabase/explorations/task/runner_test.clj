@@ -1,11 +1,15 @@
 (ns metabase.explorations.task.runner-test
   (:require
    [clojure.test :refer :all]
+   [metabase.contextual-interestingness.core :as contextual-interestingness]
    [metabase.explorations.interestingness :as explorations.interestingness]
    [metabase.explorations.models.exploration-query-result :as eqr]
    [metabase.explorations.task.runner :as runner]
    [metabase.lib.core :as lib]
    [metabase.lib.metadata :as lib.metadata]
+   [metabase.metabot.scope]
+   [metabase.metabot.self.claude]
+   [metabase.metabot.usage]
    [metabase.test :as mt]
    [toucan2.core :as t2])
   (:import
@@ -153,6 +157,136 @@
             (is (some? sr))
             (is (pos? (count (:result_data sr))))
             (is (nil? (:interestingness_score result)))))))))
+
+(deftest run-one-iteration-writes-contextual-score-test
+  (testing "When the thread has a prompt and the lego returns a score, it lands on the result row"
+    (mt/with-temp [:model/User u {:email "ctx-score@example.com"}
+                   :model/Card card {:type :metric
+                                     :creator_id (:id u)
+                                     :dataset_query (lib/->legacy-MBQL (let [mp (mt/metadata-provider)] (-> (lib/query mp (lib.metadata/table mp (mt/id :venues))) (lib/aggregate (lib/count)))))}]
+      (let [thread (temp-thread! (:id u) "Why are venue counts dropping in this region?")
+            row    (pending-query! (:id thread) (:id card)
+                                   (lib/->legacy-MBQL (let [mp (mt/metadata-provider)] (-> (lib/query mp (lib.metadata/table mp (mt/id :venues))) (lib/aggregate (lib/count)) (lib/breakout (lib.metadata/field mp (mt/id :venues :category_id)))))))]
+        (mt/with-dynamic-fn-redefs [contextual-interestingness/score-and-describe-chart
+                                    (fn [_inputs] {:score 0.73})]
+          (drain-until-terminal! (:id row) 10)
+          (let [result (t2/select-one :model/ExplorationQueryResult
+                                      :exploration_query_id (:id row))]
+            (is (= 0.73 (:contextual_interestingness_score result)))))))))
+
+(deftest run-one-iteration-skips-contextual-when-prompt-blank-test
+  (testing "Threads with no prompt → contextual_interestingness_score is nil and the lego is not called"
+    (mt/with-temp [:model/User u {:email "ctx-noprompt@example.com"}
+                   :model/Card card {:type :metric
+                                     :creator_id (:id u)
+                                     :dataset_query (lib/->legacy-MBQL (let [mp (mt/metadata-provider)] (-> (lib/query mp (lib.metadata/table mp (mt/id :venues))) (lib/aggregate (lib/count)))))}]
+      (let [thread (temp-thread! (:id u))
+            row    (pending-query! (:id thread) (:id card)
+                                   (lib/->legacy-MBQL (let [mp (mt/metadata-provider)] (-> (lib/query mp (lib.metadata/table mp (mt/id :venues))) (lib/aggregate (lib/count)) (lib/breakout (lib.metadata/field mp (mt/id :venues :category_id)))))))
+            calls  (atom 0)]
+        (mt/with-dynamic-fn-redefs [contextual-interestingness/score-and-describe-chart
+                                    (fn [_inputs] (swap! calls inc) {:score 0.99})]
+          (drain-until-terminal! (:id row) 10)
+          (let [result (t2/select-one :model/ExplorationQueryResult
+                                      :exploration_query_id (:id row))]
+            (is (nil? (:contextual_interestingness_score result)))
+            (is (zero? @calls) "lego must not be called when the thread has no prompt")))))))
+
+(deftest run-one-iteration-survives-contextual-failure-test
+  (testing "A throwing contextual scorer leaves the row done, heuristic still scored, contextual nil"
+    (mt/with-temp [:model/User u {:email "ctx-throw@example.com"}
+                   :model/Card card {:type :metric
+                                     :creator_id (:id u)
+                                     :dataset_query (lib/->legacy-MBQL (let [mp (mt/metadata-provider)] (-> (lib/query mp (lib.metadata/table mp (mt/id :venues))) (lib/aggregate (lib/count)))))}]
+      (let [thread (temp-thread! (:id u) "anything")
+            row    (pending-query! (:id thread) (:id card)
+                                   (lib/->legacy-MBQL (let [mp (mt/metadata-provider)] (-> (lib/query mp (lib.metadata/table mp (mt/id :venues))) (lib/aggregate (lib/count)) (lib/breakout (lib.metadata/field mp (mt/id :venues :category_id)))))))]
+        (mt/with-dynamic-fn-redefs [contextual-interestingness/score-and-describe-chart
+                                    (fn [& _] (throw (ex-info "boom" {})))]
+          (let [final  (drain-until-terminal! (:id row) 10)
+                result (t2/select-one :model/ExplorationQueryResult
+                                      :exploration_query_id (:id row))
+                sr     (stored-result-for (:id row))]
+            (is (= "done" (:status final)))
+            (is (some? result))
+            (is (some? sr))
+            (is (pos? (count (:result_data sr))))
+            (is (nil? (:contextual_interestingness_score result)))
+            (is (double? (:interestingness_score result))
+                "heuristic score still computed when contextual fails")))))))
+
+(deftest run-one-iteration-skips-contextual-without-other-tools-permission-test
+  (testing "When the exploration creator lacks :permission/metabot-other-tools, the
+            permission check inside metabot.self/call-llm-structured-with-trace throws,
+            score-and-describe-chart catches and returns nil, and the EQR row's
+            contextual fields land nil (UXW-4126)"
+    (mt/with-temp [:model/User u {:email "ctx-noperm@example.com"}
+                   :model/Card card {:type :metric
+                                     :creator_id (:id u)
+                                     :dataset_query (lib/->legacy-MBQL (let [mp (mt/metadata-provider)] (-> (lib/query mp (lib.metadata/table mp (mt/id :venues))) (lib/aggregate (lib/count)))))}]
+      (let [thread (temp-thread! (:id u) "Some prompt about venues")
+            row    (pending-query! (:id thread) (:id card)
+                                   (lib/->legacy-MBQL (let [mp (mt/metadata-provider)] (-> (lib/query mp (lib.metadata/table mp (mt/id :venues))) (lib/aggregate (lib/count)) (lib/breakout (lib.metadata/field mp (mt/id :venues :category_id)))))))
+            llm-calls (atom 0)]
+        (mt/with-dynamic-fn-redefs [metabase.metabot.scope/resolve-user-permissions
+                                    (fn [_uid] {:permission/metabot                :yes
+                                                :permission/metabot-sql-generation :yes
+                                                :permission/metabot-nlq            :yes
+                                                :permission/metabot-other-tools    :no})
+                                    metabase.metabot.self.claude/claude
+                                    (fn [& _] (swap! llm-calls inc) [])]
+          (drain-until-terminal! (:id row) 10)
+          (let [result (t2/select-one :model/ExplorationQueryResult
+                                      :exploration_query_id (:id row))]
+            (is (zero? @llm-calls)
+                "LLM must not be invoked when creator lacks :permission/metabot-other-tools")
+            (is (nil? (:contextual_interestingness_score result)))
+            (is (nil? (:metric_description result)))
+            (is (nil? (:chart_description result)))))))))
+
+(deftest run-one-iteration-skips-contextual-without-base-metabot-permission-test
+  (testing "When the creator has metabot-other-tools but lacks the base :permission/metabot, scoring is still skipped"
+    (mt/with-temp [:model/User u {:email "ctx-nobase@example.com"}
+                   :model/Card card {:type :metric
+                                     :creator_id (:id u)
+                                     :dataset_query (lib/->legacy-MBQL (let [mp (mt/metadata-provider)] (-> (lib/query mp (lib.metadata/table mp (mt/id :venues))) (lib/aggregate (lib/count)))))}]
+      (let [thread (temp-thread! (:id u) "Some prompt")
+            row    (pending-query! (:id thread) (:id card)
+                                   (lib/->legacy-MBQL (let [mp (mt/metadata-provider)] (-> (lib/query mp (lib.metadata/table mp (mt/id :venues))) (lib/aggregate (lib/count)) (lib/breakout (lib.metadata/field mp (mt/id :venues :category_id)))))))
+            llm-calls (atom 0)]
+        (mt/with-dynamic-fn-redefs [metabase.metabot.scope/resolve-user-permissions
+                                    (fn [_uid] {:permission/metabot                :no
+                                                :permission/metabot-sql-generation :yes
+                                                :permission/metabot-nlq            :yes
+                                                :permission/metabot-other-tools    :yes})
+                                    metabase.metabot.self.claude/claude
+                                    (fn [& _] (swap! llm-calls inc) [])]
+          (drain-until-terminal! (:id row) 10)
+          (is (zero? @llm-calls)
+              "LLM must not be invoked when creator lacks base :permission/metabot"))))))
+
+(deftest run-one-iteration-skips-contextual-when-usage-limit-reached-test
+  (testing "When check-usage-limits! returns a limit message, the usage check inside
+            metabot.self/call-llm-structured-with-trace throws and the contextual fields
+            land nil (UXW-4126)"
+    (mt/with-temp [:model/User u {:email "ctx-limit@example.com"}
+                   :model/Card card {:type :metric
+                                     :creator_id (:id u)
+                                     :dataset_query (lib/->legacy-MBQL (let [mp (mt/metadata-provider)] (-> (lib/query mp (lib.metadata/table mp (mt/id :venues))) (lib/aggregate (lib/count)))))}]
+      (let [thread (temp-thread! (:id u) "Some prompt about venues")
+            row    (pending-query! (:id thread) (:id card)
+                                   (lib/->legacy-MBQL (let [mp (mt/metadata-provider)] (-> (lib/query mp (lib.metadata/table mp (mt/id :venues))) (lib/aggregate (lib/count)) (lib/breakout (lib.metadata/field mp (mt/id :venues :category_id)))))))
+            llm-calls (atom 0)]
+        (mt/with-dynamic-fn-redefs [metabase.metabot.usage/check-usage-limits!
+                                    (fn [] "you've hit your AI usage limit")
+                                    metabase.metabot.self.claude/claude
+                                    (fn [& _] (swap! llm-calls inc) [])]
+          (drain-until-terminal! (:id row) 10)
+          (let [result (t2/select-one :model/ExplorationQueryResult
+                                      :exploration_query_id (:id row))]
+            (is (zero? @llm-calls)
+                "LLM must not be invoked when usage limit is reached")
+            (is (nil? (:contextual_interestingness_score result)))))))))
 
 (deftest run-one-iteration-error-path-test
   (testing "A row whose query blows up is marked error, no result row is written"

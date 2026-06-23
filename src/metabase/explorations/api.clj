@@ -37,20 +37,24 @@
 
 (def ^:private query-summary-columns
   "Column projection for `::ExplorationQuerySummary` rows — excludes `dataset_query` and the
-  result blob. Later slices extend this with the joined interestingness scores."
+  result blob, joins both interestingness scores from `exploration_query_result`."
   [:exploration_query.id :exploration_query.exploration_thread_id
    :exploration_query.card_id :exploration_query.segment_id
    :exploration_query.dimension_id :exploration_query.query_type
    :exploration_query.display :exploration_query.name :exploration_query.position
    :exploration_query.status :exploration_query.error_message
    :exploration_query.user_interestingness
-   :exploration_query.entity_id])
+   :exploration_query.entity_id
+   [:exploration_query_result.interestingness_score            :interestingness_score]
+   [:exploration_query_result.contextual_interestingness_score :contextual_interestingness_score]])
 
 (defn- query-summary
   "Fetch a single `::ExplorationQuerySummary` row by `exploration_query.id`."
   [query-id]
   (t2/select-one (into [:model/ExplorationQuery] query-summary-columns)
-                 {:where [:= :exploration_query.id query-id]}))
+                 {:left-join [:exploration_query_result
+                              [:= :exploration_query_result.exploration_query_id :exploration_query.id]]
+                  :where     [:= :exploration_query.id query-id]}))
 
 (defn- get-thread-or-404
   "Fetch the thread and its parent exploration, or 404."
@@ -169,7 +173,9 @@
    [:status                :string]
    [:error_message         {:optional true} [:maybe :string]]
    [:user_interestingness  {:optional true} [:maybe [:enum 0 1 2]]]
-   [:entity_id             {:optional true} [:maybe :string]]])
+   [:entity_id             {:optional true} [:maybe :string]]
+   [:interestingness_score            {:optional true} [:maybe number?]]
+   [:contextual_interestingness_score {:optional true} [:maybe number?]]])
 
 (mr/def ::ExplorationQueryStreamResponse
   "Schema for `GET /query/:id`. On success the body is a streamed dataset (api/csv/json/xlsx),
@@ -357,7 +363,9 @@
   (api/read-check (get-exploration-or-404 id))
   (t2/select (into [:model/ExplorationQuery] query-summary-columns)
              {:left-join [:exploration_thread
-                          [:= :exploration_query.exploration_thread_id :exploration_thread.id]]
+                          [:= :exploration_query.exploration_thread_id :exploration_thread.id]
+                          :exploration_query_result
+                          [:= :exploration_query_result.exploration_query_id :exploration_query.id]]
               :where     [:= :exploration_thread.exploration_id id]
               :order-by  [[:exploration_query.position :asc] [:exploration_query.id :asc]]}))
 
