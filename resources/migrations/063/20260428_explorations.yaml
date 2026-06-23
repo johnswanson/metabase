@@ -1438,3 +1438,31 @@ databaseChangeLog:
               )
               WHERE ai_summary_document_id IS NULL
       rollback:
+
+  - changeSet:
+      id: v63.startedat
+      author: nvoxland
+      comment: Add exploration_thread.analysis_started_at
+      changes:
+        - addColumn:
+            tableName: exploration_thread
+            columns:
+              - column:
+                  name: analysis_started_at
+                  type: ${timestamp_type}
+                  remarks: Set once when every query in the thread has reached a terminal status AND every (query, timeline) pair has been scored. CAS gate that ensures the auto-insights handler fires exactly once per thread. completed_at is set later, when the handler finishes.
+                  constraints:
+                    nullable: true
+
+  - changeSet:
+      id: v63.startedatbf
+      author: nvoxland
+      comment: Backfill exploration_thread.analysis_started_at for pre-existing threads
+      changes:
+        - update:
+            tableName: exploration_thread
+            columns:
+              - column:
+                  name: analysis_started_at
+                  valueComputed: current_timestamp
+            where: analysis_started_at IS NULL
