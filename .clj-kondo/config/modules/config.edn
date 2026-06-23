@@ -1317,6 +1317,7 @@
               config
               documents
               driver
+              explorations
               interestingness
               legacy-mbql
               lib
@@ -1340,6 +1341,7 @@
               sync
               system
               task
+              timeline
               transforms
               transforms-base
               util
