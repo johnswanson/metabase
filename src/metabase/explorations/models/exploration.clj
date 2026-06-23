@@ -2,6 +2,7 @@
   (:require
    [clojure.string :as str]
    [metabase.models.interface :as mi]
+   [metabase.search.spec :as search.spec]
    [metabase.util.i18n :refer [deferred-tru]]
    [metabase.util.malli :as mu]
    [methodical.core :as methodical]
@@ -47,3 +48,24 @@
                          {:order-by [[:position :asc] [:id :asc]]}))
    :id
    {:default []}))
+
+;;; ----------------------------------------------- Search ----------------------------------------------------------
+
+(search.spec/define-spec "exploration"
+  {:model :model/Exploration
+   :attrs {:archived :archived
+           :collection-id :collection_id
+           :creator-id :creator_id
+           :created-at :created_at
+           :updated-at :updated_at
+           :pinned [:> [:coalesce :collection_position [:inline 0]] [:inline 0]]}
+   :search-terms [:name :description]
+   :joins {:collection [:model/Collection [:= :collection.id :this.collection_id]]}
+   :render-terms {:exploration-name :name
+                  :exploration-id :id
+                  :collection-authority_level :collection.authority_level
+                  :collection-location        :collection.location
+                  :collection-name            :collection.name
+                  :collection-position        true
+                  :collection-type            :collection.type
+                  :archived-directly          true}})
