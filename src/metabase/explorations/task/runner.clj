@@ -55,14 +55,21 @@
 (defn- claim-pending-query
   "Claim a single pending row with `FOR UPDATE SKIP LOCKED` so peer workers don't fight for it.
   H2 doesn't support SKIP LOCKED, but we cap H2 at one worker (see `worker-count`) so dropping
-  the lock clause is safe there."
+  the lock clause is safe there.
+
+  Skips rows on a canceled thread: the cancel-thread endpoint may have written `canceled_at` after
+  the row was inserted (e.g. by a planner iteration that lost the cancel race), so the claim joins
+  to `exploration_thread.canceled_at IS NULL`."
   []
   (t2/select-one :model/ExplorationQuery
-                 (cond-> {:select   [:*]
-                          :from     [:exploration_query]
-                          :where    [:= :status "pending"]
-                          :order-by [[:id :asc]]
-                          :limit    1}
+                 (cond-> {:select    [:eq.*]
+                          :from      [[:exploration_query :eq]]
+                          :join      [[:exploration_thread :et] [:= :et.id :eq.exploration_thread_id]]
+                          :where     [:and
+                                      [:= :eq.status "pending"]
+                                      [:= :et.canceled_at nil]]
+                          :order-by  [[:eq.id :asc]]
+                          :limit     1}
                    (not= :h2 (mdb/db-type)) (assoc :for [:update :skip-locked]))))
 
 (defn- serialize-result
@@ -263,6 +270,7 @@
                    {:where    [:and
                                [:not= :started_at nil]
                                [:= :query_plan_started_at nil]
+                               [:= :canceled_at nil]
                                [:not-exists {:select [1]
                                              :from   [:exploration_query]
                                              :where  [:= :exploration_query.exploration_thread_id
@@ -276,6 +284,19 @@
                               {:query_plan_started_at (OffsetDateTime/now)}))
         thread-id))))
 
+(defn- canceled-mid-plan-cleanup!
+  "Planner-race repair: the user can cancel a thread *after* the planner claimed it (set
+  `query_plan_started_at`) but *before* `generate-query-plan!` returned. The cancel endpoint's
+  bulk pending→canceled UPDATE only saw the EQ rows that existed at cancel time; rows the planner
+  inserted after that are still `pending` on a canceled thread. Flip them here so the EQ table
+  matches its owning thread's terminal state."
+  [thread-id]
+  (when (t2/exists? :model/ExplorationThread :id thread-id :canceled_at [:not= nil])
+    (t2/update! :model/ExplorationQuery
+                {:exploration_thread_id thread-id
+                 :status                "pending"}
+                {:status "canceled"})))
+
 (defn- run-one-plan-iteration!
   "Try to claim one unplanned thread and run the planner against it. Returns
   truthy when work was done so the worker loop knows whether to sleep."
@@ -285,6 +306,7 @@
       (explorations.query-plan/generate-query-plan! thread-id)
       (catch Throwable e
         (log/errorf e "Exploration thread %d: query plan iteration crashed" thread-id)))
+    (canceled-mid-plan-cleanup! thread-id)
     :worked))
 
 (defn- run-one-iteration!
