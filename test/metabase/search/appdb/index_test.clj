@@ -537,7 +537,7 @@
 
 (def ^:private model->deleted-descendants
   ;; Note that these refer to the table names, not the search-model names.
-  {"core_user"         #{"action" "collection" "document" "measure" "model_index_value" "report_card" "report_dashboard" "segment" "transform"}
+  {"core_user"         #{"action" "collection" "document" "exploration" "measure" "model_index_value" "report_card" "report_dashboard" "segment" "transform"}
    "model_index"       #{"model_index_value"}
    "metabase_database" #{"action" "measure" "metabase_table" "model_index_value" "report_card" "segment"}
    "metabase_table"    #{"action" "measure" "model_index_value" "report_card" "segment"}
