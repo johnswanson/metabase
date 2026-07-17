@@ -1036,6 +1036,7 @@
            query-processor
            request
            settings
+           timeline
            types
            util}
    :model-exports #{:model/Exploration}
@@ -1045,6 +1046,7 @@
                     :model/Segment
                     :model/StoredResult
                     :model/StoredResultUse
+                    :model/Timeline
                     :model/User}}
 
   formatter
