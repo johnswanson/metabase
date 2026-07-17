@@ -1,6 +1,7 @@
 (ns metabase.explorations.api
   "`/api/exploration` routes."
   (:require
+   [clojure.string :as str]
    [java-time.api :as t]
    [metabase.api.common :as api]
    [metabase.api.macros :as api.macros]
@@ -8,15 +9,21 @@
    [metabase.app-db.core :as mdb]
    [metabase.collections.models.collection :as collection]
    [metabase.events.core :as events]
+   [metabase.explorations.blocks :as explorations.blocks]
    [metabase.explorations.core :as explorations]
+   [metabase.explorations.derived-perms :as derived-perms]
    [metabase.explorations.models.exploration :as expl.model]
+   [metabase.explorations.models.exploration-block :as block]
    [metabase.explorations.models.exploration-query-result :as eqr]
+   [metabase.explorations.query-plan.context :as qp.context]
    [metabase.explorations.queues :as explorations.queues]
+   [metabase.lib-be.core :as lib-be]
    [metabase.queries.core :as queries]
    [metabase.query-processor.core :as qp]
    [metabase.query-processor.pipeline :as qp.pipeline]
    [metabase.query-processor.streaming :as qp.streaming]
    [metabase.request.core :as request]
+   [metabase.util :as u]
    [metabase.util.i18n :refer [tru]]
    [metabase.util.malli.registry :as mr]
    [metabase.util.malli.schema :as ms]
@@ -44,8 +51,154 @@
         (api/write-check :model/Collection new-coll)
         (api/write-check collection/root-collection)))))
 
+(defn- exploration-query-dim-label
+  "Display label for a dimension inside an ExplorationQuery `name`. When `ambiguous?` and the dim
+  has a known group, prefixes with the group's display name and the canonical ` → ` separator
+  (matches `metabase.lib.display-name/separator`). Otherwise falls back to the dim's display name
+  (or id when missing)."
+  [dim ambiguous?]
+  (let [dn       (or (:display_name dim) (:dimension_id dim))
+        group-dn (some-> dim :group :display_name)]
+    (if (and ambiguous? (not (str/blank? group-dn)))
+      (str group-dn " → " dn)
+      dn)))
+
+(defn- blocks-by-thread-id
+  "The persisted blocks (`ExplorationBlock`) for `thread-ids`, in authoring order, grouped by
+   `:exploration_thread_id`."
+  [thread-ids]
+  (when (seq thread-ids)
+    (group-by :exploration_thread_id
+              (t2/select :model/ExplorationBlock
+                         :exploration_thread_id [:in thread-ids]
+                         {:order-by [[:position :asc] [:id :asc]]}))))
+
+(defn- enrich-block-dimensions
+  "Attach each block dimension's `:group` (source) label from `card-dim-by-id` so the read tree
+  can qualify same-named dimension headings by their source."
+  [blocks card-dim-by-id]
+  (mapv (fn [block]
+          (update block :dimensions
+                  (fn [dims]
+                    (mapv #(block/enrich-with-card-group % card-dim-by-id) dims))))
+        blocks))
+
+(defn- attach-query-dimension-labels
+  "Attach `:dimension_name` to each query on `thread`. Dimension snapshots come from the
+  thread's `blocks` (deduped by id); each is enriched with `:group` looked up from
+  `card-dim-by-id` (the metric Cards' snapshotted `:dimensions`, the only place that group
+  metadata lives), then `exploration-query-dim-label` is applied with ambiguity scoped to the
+  thread's dimensions."
+  [thread blocks card-dim-by-id]
+  (let [thread-dims   (vals (u/index-by :dimension_id (mapcat :dimensions blocks)))
+        enriched-dims (mapv #(block/enrich-with-card-group % card-dim-by-id)
+                            thread-dims)
+        dim-by-id     (u/index-by :dimension_id enriched-dims)
+        name-counts   (frequencies (keep :display_name enriched-dims))]
+    (update thread :queries
+            (fn [queries]
+              (some->> queries
+                       (mapv (fn [q]
+                               (let [dim-id     (:dimension_id q)
+                                     dim        (or (get dim-by-id dim-id)
+                                                    {:dimension_id dim-id})
+                                     ambiguous? (> (get name-counts (:display_name dim) 0) 1)]
+                                 (assoc q :dimension_name
+                                        (exploration-query-dim-label dim ambiguous?))))))))))
+
+(defn- attach-thread-read-data
+  "Compute the read-side nested `:blocks` (each with its `:pages`) and per-query
+  `:dimension_name` labels for `thread` from its pre-fetched `blocks`, `pages`, and the shared
+  metric-Card lookup maps (`card-name-by-id` for page/heading names, `card-dim-by-id` for
+  dimension source metadata)."
+  [thread blocks pages card-name-by-id card-dim-by-id]
+  (let [enriched-blocks (enrich-block-dimensions blocks card-dim-by-id)
+        ;; Label queries first so blocks-tree can name metric-anchored pages "By <dimension>".
+        labeled         (attach-query-dimension-labels thread enriched-blocks card-dim-by-id)]
+    (assoc labeled :blocks (explorations.blocks/blocks-tree
+                            enriched-blocks pages card-name-by-id (:queries labeled)))))
+
+(defn- attach-threads-read-data
+  "Batch [[attach-thread-read-data]] across `threads`: select every thread's blocks, their
+  pages, and the metric Cards they reference in a fixed number of queries (not per thread,
+  which N+1s), then enrich each thread in memory."
+  [threads]
+  (let [blocks-by-thread (blocks-by-thread-id (map :id threads))
+        all-blocks       (mapcat val blocks-by-thread)
+        block-ids        (map :id all-blocks)
+        pages-by-block   (when (seq block-ids)
+                           (group-by :exploration_block_id
+                                     (t2/select :model/ExplorationPage
+                                                :exploration_block_id [:in block-ids])))
+        card-ids         (distinct (mapcat #(map :card_id (:metrics %)) all-blocks))
+        cards            (when (seq card-ids)
+                           (t2/select [:model/Card :id :name :dimensions] :id [:in card-ids]))
+        card-name-by-id  (into {} (map (juxt :id :name)) cards)
+        card-dim-by-id   (into {}
+                               (mapcat (fn [c] (map (juxt :id identity) (:dimensions c))))
+                               cards)]
+    (mapv (fn [thread]
+            (let [blocks (get blocks-by-thread (:id thread) [])
+                  pages  (mapcat #(get pages-by-block (:id %) []) blocks)]
+              (attach-thread-read-data thread blocks pages card-name-by-id card-dim-by-id)))
+          threads)))
+
+(defn- gate-threads-derived-data
+  "Drop every thread's derived read-data — its queries, the block/page tree built from them, and the
+  thread name — when the current user's data-access lens isn't compatible with the creator's lens
+  that produced it. All three embed verbatim values from the creator's results (discovered top-N
+  dimension values in query names and `dataset_query`s; the clicked segment an \"Explore further\"
+  thread is named for), and those results are themselves gated where they're streamed. Threads the
+  viewer *can* see are enriched as usual. See [[metabase.explorations.derived-perms]]."
+  [threads]
+  (let [visible-ids (derived-perms/thread-ids-with-visible-derived-data (map :id threads))
+        enriched    (u/index-by :id
+                                (attach-threads-read-data
+                                 (filterv #(contains? visible-ids (:id %)) threads)))]
+    (mapv (fn [thread]
+            (or (get enriched (:id thread))
+                (assoc thread :queries [] :blocks [] :name nil)))
+          threads)))
+
+(defn- thread-status
+  "Derived, wire-facing lifecycle status for a hydrated thread, so the FE can tell a successful
+  run from a failed/empty/canceled one. One of:
+
+    \"pending\"   — not started yet
+    \"running\"   — started, still working
+    \"canceled\"  — the user stopped it
+    \"empty\"     — terminal, the planner had nothing applicable to chart (NOT an error)
+    \"failed\"    — terminal, planning failed or every query errored
+    \"completed\" — terminal, at least one chart is available"
+  [{:keys [started_at canceled_at completed_at queries] :as thread}]
+  (let [outcome (get-in thread [:query_plan_transcript :outcome])]
+    (cond
+      (some? canceled_at)                    "canceled"
+      (nil? started_at)                      "pending"
+      (nil? completed_at)                    "running"
+      (= :skip-empty outcome)                "empty"
+      (contains? #{:failed :error} outcome)  "failed"
+      (some #(= "done" (:status %)) queries) "completed"
+      ;; terminal, not canceled/empty/plan-failed, yet no query reached `done`
+      ;; (every query errored, or planning left none) — surface it as a failure.
+      :else                                  "failed")))
+
+(defn- attach-thread-status
+  "Add the wire-facing derived `:status` to a hydrated thread and drop the internal
+  `:query_plan_transcript` — [[thread-status]] reads it (for the failed-vs-empty distinction),
+  but the FE never does, so it shouldn't ride the wire. Runs before permission-gating, so status
+  reflects the thread's real queries."
+  [thread]
+  (-> thread
+      (assoc :status (thread-status thread))
+      (dissoc :query_plan_transcript)))
+
 (defn- hydrate-exploration [exploration]
-  (t2/hydrate exploration :creator :can_write :collection [:threads :timelines]))
+  (-> exploration
+      (t2/hydrate :creator :can_write :collection
+                  [:threads :queries :timelines])
+      (update :threads
+              #(some->> % (mapv attach-thread-status) gate-threads-derived-data))))
 
 (defn- positional-rows
   "Stamp `:exploration_thread_id` and a 0-based `:position` onto each row in `rows`."
@@ -112,38 +265,70 @@
       (explorations.queues/start-thread! thread-id)
       true)))
 
+(defn- stringify-dim-types
+  "Turn a block's `:dimensions` back into wire form for re-insertion. The model's read transform
+  keywordizes `:effective_type`/`:semantic_type` (e.g. `:type/Date`); the JSON write transform
+  would otherwise drop the namespace on a bare keyword, so stringify them first."
+  [dimensions]
+  (mapv (fn [dim]
+          (cond-> dim
+            (keyword? (:effective_type dim)) (update :effective_type u/qualified-name)
+            (keyword? (:semantic_type dim))  (update :semantic_type u/qualified-name)))
+        dimensions))
+
+(defn- format-explore-filter-for-thread-name
+  [{:keys [dimension_name display_value value]}]
+  (let [value-str (or (some-> display_value str/trim not-empty)
+                      (some-> value str))]
+    (if (and dimension_name (not (str/blank? value-str)))
+      (str dimension_name ": " value-str)
+      value-str)))
+
+(defn- explore-further-thread-name
+  "Build the sidebar name for an \"Explore further\" thread from enriched `explore_filters`.
+  Top-level follow-ups (drilled from the initial investigation) prefix the metric name;
+  nested follow-ups use only the formatted filters."
+  [card-name enriched-filters top-level-follow-up?]
+  (let [formatted (->> enriched-filters
+                       (keep format-explore-filter-for-thread-name)
+                       (str/join ", ")
+                       not-empty)]
+    (cond
+      (and top-level-follow-up? formatted card-name)
+      (str card-name " → " formatted)
+
+      formatted
+      formatted
+
+      :else
+      card-name)))
+
 ;;; ----------------------------------------- schemas -----------------------------------------
 
-(mr/def ::HydratedThread
-  "Schema for an Exploration thread."
+(def ^:private MetricSelection
   [:map
-   [:id             ms/PositiveInt]
-   [:exploration_id ms/PositiveInt]
-   [:prompt         {:optional true} [:maybe :string]]
-   [:position       ms/IntGreaterThanOrEqualToZero]
-   [:started_at     {:optional true} [:maybe :any]]
-   [:canceled_at    {:optional true} [:maybe :any]]
-   [:completed_at   {:optional true} [:maybe :any]]
-   [:timelines      {:optional true}
-    [:maybe [:sequential
-             [:map
-              [:timeline_id ms/PositiveInt]
-              [:position    {:optional true} ms/IntGreaterThanOrEqualToZero]
-              [:timeline    {:optional true} [:maybe :map]]]]]]])
+   [:card_id ms/PositiveInt]
+   [:dimension_mappings {:optional true} [:maybe [:sequential :map]]]])
 
-(mr/def ::HydratedExploration
-  "Schema for an Exploration with hydrated creator and threads."
+(def ^:private DimensionSelection
   [:map
-   [:id            ms/PositiveInt]
-   [:name          :string]
-   [:description   {:optional true} [:maybe :string]]
-   [:creator_id    ms/PositiveInt]
-   [:creator       {:optional true} [:maybe :map]]
-   [:collection_id {:optional true} [:maybe ms/PositiveInt]]
-   [:archived      {:optional true} :boolean]
-   [:threads       {:optional true} [:maybe [:sequential ::HydratedThread]]]
-   [:created_at    {:optional true} [:maybe :any]]
-   [:updated_at    {:optional true} [:maybe :any]]])
+   [:dimension_id   ms/NonBlankString]
+   [:display_name   {:optional true} [:maybe :string]]
+   [:effective_type {:optional true} [:maybe :string]]
+   [:semantic_type  {:optional true} [:maybe :string]]])
+
+(def ^:private BlockSelection
+  "One Research-plan area on the FE — either a metric area (one primary metric + chosen dimensions)
+   or a dimension area (the dimension's group + referencing metrics). Persisted verbatim as one
+   `ExplorationBlock` row; the planners cross this block's metrics with this block's
+   dimensions only. The sidebar heading is computed read-side (the `:name` of an
+   `ExplorationBlockNode`), not supplied here."
+  [:map
+   ;; Whether the block is anchored on its metric or its dimension. The read side
+   ;; uses this to build the sidebar heading + sub-item names.
+   [:type       {:optional true} [:maybe [:enum "metric" "dimension"]]]
+   [:metrics    {:optional true} [:maybe [:sequential MetricSelection]]]
+   [:dimensions {:optional true} [:maybe [:sequential DimensionSelection]]]])
 
 (mr/def ::ExplorationQuerySummary
   "Schema for a query row in API responses. The result blob and `dataset_query` aren't
@@ -173,6 +358,61 @@
    [:contextual_interestingness_score {:optional true} [:maybe number?]]
    [:row_count                        {:optional true} [:maybe ms/IntGreaterThanOrEqualToZero]]])
 
+(mr/def ::ExplorationPageNode
+  "A page within a block: the bundle of queries for one (card, dimension, query_type) under the
+   page's stable id. `:query_ids` reference queries on the same thread, sorted by interestingness.
+   `:position` is the page's 0-indexed slot among its block's pages. `:name` is the page's short,
+   heading-relative label (e.g. `By Category over time`); `:long_name` is the full
+   self-describing name (e.g. `Number of Orders by Category over time`) for use without the block
+   heading for context."
+  [:map
+   [:id        ms/PositiveInt]
+   [:name      [:maybe :string]]
+   [:long_name [:maybe :string]]
+   [:position  ms/IntGreaterThanOrEqualToZero]
+   [:query_ids [:sequential ms/PositiveInt]]
+   [:starred   :boolean]
+   [:hidden    :boolean]])
+
+(mr/def ::ExplorationBlockNode
+  "A block (the FE's sidebar group): a heading plus its pages. `:type` is whether the block is
+   anchored on its metric or its dimension; `:name` is the computed heading (the metric name, or
+   `By <dimension>`). `:position` is the block's 0-indexed authoring slot."
+  [:map
+   [:id              ms/PositiveInt]
+   [:type            [:enum "metric" "dimension"]]
+   [:name            [:maybe :string]]
+   [:position        ms/IntGreaterThanOrEqualToZero]
+   [:explore_filters {:optional true}
+    [:maybe [:sequential
+             [:map
+              [:field_ref     [:sequential :any]]
+              [:value         :any]
+              [:display_value {:optional true} [:maybe :string]]
+              [:dimension_name {:optional true} [:maybe :string]]]]]]
+   [:pages           [:sequential ::ExplorationPageNode]]])
+
+(mr/def ::HydratedThread
+  "Schema for an Exploration thread with hydrated selections and queries."
+  [:map
+   [:id                         ms/PositiveInt]
+   [:exploration_id             ms/PositiveInt]
+   [:prompt                     {:optional true} [:maybe :string]]
+   [:position                   ms/IntGreaterThanOrEqualToZero]
+   [:source_page_id             {:optional true} [:maybe ms/PositiveInt]]
+   [:started_at                 {:optional true} [:maybe :any]]
+   [:canceled_at                {:optional true} [:maybe :any]]
+   [:completed_at               {:optional true} [:maybe :any]]
+   [:status                     [:enum "pending" "running" "canceled" "empty" "failed" "completed"]]
+   [:queries                    {:optional true} [:maybe [:sequential ::ExplorationQuerySummary]]]
+   [:blocks                     {:optional true} [:maybe [:sequential ::ExplorationBlockNode]]]
+   [:timelines                  {:optional true}
+    [:maybe [:sequential
+             [:map
+              [:timeline_id ms/PositiveInt]
+              [:position    {:optional true} ms/IntGreaterThanOrEqualToZero]
+              [:timeline    {:optional true} [:maybe :map]]]]]]])
+
 (mr/def ::ExplorationQueryStreamResponse
   "Schema for `GET /query/:id`. On success the body is a streamed dataset (api/csv/json/xlsx),
    so we describe it as `:any`. On a not-yet-done query we return a 409 with a status payload."
@@ -186,6 +426,20 @@
               [:error_message {:optional true} [:maybe :string]]
               [:started_at    {:optional true} [:maybe :any]]
               [:finished_at   {:optional true} [:maybe :any]]]]]])
+
+(mr/def ::HydratedExploration
+  "Schema for an Exploration with hydrated creator and threads."
+  [:map
+   [:id            ms/PositiveInt]
+   [:name          :string]
+   [:description   {:optional true} [:maybe :string]]
+   [:creator_id    ms/PositiveInt]
+   [:creator       {:optional true} [:maybe :map]]
+   [:collection_id {:optional true} [:maybe ms/PositiveInt]]
+   [:archived      {:optional true} :boolean]
+   [:threads       {:optional true} [:maybe [:sequential ::HydratedThread]]]
+   [:created_at    {:optional true} [:maybe :any]]
+   [:updated_at    {:optional true} [:maybe :any]]])
 
 (mr/def ::ExplorationSummary
   "Lightweight row for the `GET /mine` list. No threads/queries — just the metadata
@@ -227,31 +481,6 @@
    [:offset [:maybe ms/IntGreaterThanOrEqualToZero]]
    [:data   [:sequential ::ExplorationSummary]]])
 
-(def ^:private MetricSelection
-  [:map
-   [:card_id ms/PositiveInt]
-   [:dimension_mappings {:optional true} [:maybe [:sequential :map]]]])
-
-(def ^:private DimensionSelection
-  [:map
-   [:dimension_id   ms/NonBlankString]
-   [:display_name   {:optional true} [:maybe :string]]
-   [:effective_type {:optional true} [:maybe :string]]
-   [:semantic_type  {:optional true} [:maybe :string]]])
-
-(def ^:private BlockSelection
-  "One Research-plan area on the FE — either a metric area (one primary metric + chosen dimensions)
-   or a dimension area (the dimension's group + referencing metrics). Persisted verbatim as one
-   `ExplorationBlock` row; the planners cross this block's metrics with this block's
-   dimensions only. The sidebar heading is computed read-side (the `:name` of an
-   `ExplorationBlockNode`), not supplied here."
-  [:map
-   ;; Whether the block is anchored on its metric or its dimension. The read side
-   ;; uses this to build the sidebar heading + sub-item names.
-   [:type       {:optional true} [:maybe [:enum "metric" "dimension"]]]
-   [:metrics    {:optional true} [:maybe [:sequential MetricSelection]]]
-   [:dimensions {:optional true} [:maybe [:sequential DimensionSelection]]]])
-
 (def ^:private CreateExploration
   "Body schema for `POST /api/exploration`.
 
@@ -265,6 +494,23 @@
    [:collection_id {:optional true} [:maybe ms/PositiveInt]]
    [:blocks        {:optional true} [:maybe [:sequential BlockSelection]]]
    [:timeline_ids  {:optional true} [:maybe [:sequential ms/PositiveInt]]]])
+
+(def ^:private ExploreFilterSpec
+  "One segment filter stamped onto a block metric selection's `:explore_filters` vector."
+  [:map
+   [:field_ref     [:sequential :any]]
+   [:value         :any]
+   [:display_value {:optional true} [:maybe :string]]
+   [:dimension_name {:optional true} [:maybe :string]]])
+
+(def ^:private ExploreFurther
+  "Body schema for `POST /api/exploration/:id/explore-further`. `page_id` is the clicked chart's
+  page — its block (metric selection + dimensions) is copied verbatim so the new thread re-runs
+  the same charts. `explore_filters` is appended to each copied metric selection's existing
+  `:explore_filters`."
+  [:map
+   [:page_id         ms/PositiveInt]
+   [:explore_filters [:sequential {:min 1} ExploreFilterSpec]]])
 
 (def ^:private UpdateExploration
   "Body schema for `PUT /api/exploration/:id`. All fields are optional; only the keys the client
@@ -359,6 +605,79 @@
                            {:object persisted :user-id api/*current-user-id*})
     (hydrate-exploration persisted)))
 
+(api.macros/defendpoint :post "/:id/explore-further" :- ::HydratedExploration
+  "Start a follow-up investigation scoped to a clicked chart segment.
+
+  The user clicked a bar/point on the chart for `page_id`; we copy that page's block (its metric
+  selection + the same dimensions) into a brand-new thread and append each `explore_filters`
+  entry onto every metric selection's `:explore_filters` vector. The background planner then
+  materializes the same set of charts, but every query is scoped to those filters — and to any
+  filters the source block already carried, so drilling from within an already-drilled thread
+  keeps the earlier scope (see
+  `metabase.explorations.query-plan.context/build-row-context`). Returns immediately with the new
+  thread stamped `started_at`; clients poll `GET /:id` for the queries to land, exactly like create."
+  [{:keys [id]} :- [:map [:id ms/PositiveInt]]
+   _query-params
+   {:keys [page_id explore_filters]} :- ExploreFurther]
+  (let [exploration (get-exploration-or-404 id)]
+    (api/write-check exploration)
+    (let [page          (api/check-404 (t2/select-one :model/ExplorationPage :id page_id))
+          block         (api/check-404 (t2/select-one :model/ExplorationBlock
+                                                      :id (:exploration_block_id page)))
+          src-thread-id (:exploration_thread_id block)
+          src-thread    (t2/select-one :model/ExplorationThread :id src-thread-id)
+          ;; The clicked page must live in *this* exploration — a page keys off a block off a
+          ;; thread off an exploration, and "Explore further" only ever drills a chart the caller
+          ;; is already viewing here. Reject anything else with a 404: without this check a caller
+          ;; could copy any page in the instance (metric selections, dimension snapshots, card ids,
+          ;; and the queries the planner then runs) into an exploration they can write (IDOR).
+          _             (api/check-404 (t2/exists? :model/ExplorationThread
+                                                   :id src-thread-id :exploration_id id))
+          metric-selection (first (:metrics block))
+          card-id       (:card_id metric-selection)
+          card          (api/check-404 (when card-id (t2/select-one :model/Card :id card-id)))
+          card-name     (:name card)
+          mp            (lib-be/application-database-metadata-provider (:database_id card))
+          enriched-filters (qp.context/enrich-explore-filters mp card block metric-selection explore_filters)
+          top-level-follow-up? (nil? (:source_page_id src-thread))
+          ;; Append, don't overwrite: a source block that itself came from a prior drill already
+          ;; carries `:explore_filters`; `into` keeps that earlier segment scope and adds this one.
+          metrics'      (mapv #(update % :explore_filters (fnil into []) enriched-filters)
+                              (:metrics block))
+          timeline-ids  (t2/select-fn-vec :timeline_id :model/ExplorationThreadTimeline
+                                          :exploration_thread_id src-thread-id
+                                          {:order-by [[:position :asc] [:id :asc]]})
+          next-position (inc (or (t2/select-one-fn :position :model/ExplorationThread
+                                                   :exploration_id id
+                                                   {:order-by [[:position :desc] [:id :desc]]})
+                                 0))]
+      (t2/with-transaction [_]
+        (let [thread (first (t2/insert-returning-instances!
+                             :model/ExplorationThread
+                             {:exploration_id id
+                              :name           (explore-further-thread-name card-name
+                                                                           enriched-filters
+                                                                           top-level-follow-up?)
+                              :position       next-position
+                              ;; drill lineage — lets the sidebar nest this thread
+                              ;; under the one owning the drilled page
+                              :source_page_id page_id}))
+              tid    (:id thread)]
+          (t2/insert! :model/ExplorationBlock
+                      {:exploration_thread_id tid
+                       :type                  (:type block)
+                       :metrics               metrics'
+                       :dimensions            (stringify-dim-types (:dimensions block))
+                       :position              0})
+          (insert-thread-timelines! tid timeline-ids)
+          ;; Stamp `started_at` last — it's the signal the planning worker claims on.
+          (t2/update! :model/ExplorationThread tid {:started_at (t/offset-date-time)})
+          (explorations.queues/start-thread! tid)
+          (let [persisted (t2/select-one :model/Exploration :id id)]
+            (events/publish-event! :event/exploration-update
+                                   {:object persisted :user-id api/*current-user-id*})
+            (hydrate-exploration persisted)))))))
+
 (api.macros/defendpoint :get "/dimensions" :- ::DimensionsResponse
   "Hydrated metrics plus a deduplicated dimension list, for the Exploration data modal.
 
@@ -429,7 +748,7 @@
      :data   (mapv #(dissoc % :total_count) rows)}))
 
 (api.macros/defendpoint :get "/:id" :- ::HydratedExploration
-  "Fetch an exploration with its thread."
+  "Fetch an exploration with its thread, selections, and generated queries."
   [{:keys [id]} :- [:map [:id ms/PositiveInt]]]
   (let [expl (api/read-check (get-exploration-or-404 id))]
     (hydrate-exploration expl)))
@@ -459,8 +778,8 @@
 (api.macros/defendpoint :delete "/:id" :- :nil
   "Hard-delete an exploration. Soft delete is `PUT /api/exploration/:id {archived: true}`.
 
-  Cascades to every `exploration_thread` via the on-delete-cascade FKs configured in the
-  explorations migration."
+  Cascades to every `exploration_thread` and `exploration_query` via the on-delete-cascade
+  FKs configured in the explorations migration."
   [{:keys [id]} :- [:map [:id ms/PositiveInt]]]
   (let [existing (get-exploration-or-404 id)]
     (api/write-check existing)
@@ -482,6 +801,10 @@
    [:exploration_query_result.interestingness_score            :interestingness_score]
    [:exploration_query_result.contextual_interestingness_score :contextual_interestingness_score]
    [:stored_result.row_count                                    :row_count]])
+
+(defn- get-exploration-page-or-404
+  [page-id]
+  (api/check-404 (t2/select-one :model/ExplorationPage :id page-id)))
 
 (defn- get-thread-or-404
   "Fetch the thread, or 404."
@@ -629,6 +952,30 @@
       ;; dashboard card that's still loading.
       {:status 409
        :body   (select-keys q [:id :status :error_message :started_at :finished_at])})))
+
+(api.macros/defendpoint :put "/page/:id/starred" :- :nil
+  "Set whether an exploration page is starred."
+  [{:keys [id]} :- [:map [:id ms/PositiveInt]]
+   _query-params
+   {:keys [starred]} :- [:map [:starred :boolean]]]
+  (let [page (get-exploration-page-or-404 id)]
+    (api/write-check page)
+    (t2/update! :model/ExplorationPage id {:starred starred}))
+  nil)
+
+(api.macros/defendpoint :put "/pages/hidden" :- :nil
+  "Set whether one or more exploration pages are hidden from the sidebar. Hiding a single
+  page passes a one-element `page_ids`; hiding a whole group passes all its page ids."
+  [_route-params
+   _query-params
+   {:keys [page_ids hidden]} :- [:map
+                                 [:page_ids [:sequential ms/PositiveInt]]
+                                 [:hidden :boolean]]]
+  (doseq [id page_ids]
+    (api/write-check (get-exploration-page-or-404 id)))
+  (when (seq page_ids)
+    (t2/update! :model/ExplorationPage :id [:in page_ids] {:hidden hidden}))
+  nil)
 
 ;;; ----------------------------------------- routes -----------------------------------------
 
