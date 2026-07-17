@@ -51,6 +51,7 @@
     :model/Exploration                       metabase.explorations.models.exploration
     :model/ExplorationBlock                  metabase.explorations.models.exploration-block
     :model/ExplorationPage                   metabase.explorations.models.exploration-page
+    :model/ExplorationQuery                  metabase.explorations.models.exploration-query
     :model/ExplorationThread                 metabase.explorations.models.exploration-thread
     :model/Field                             metabase.warehouse-schema.models.field
     :model/FieldUserSettings                 metabase.warehouse-schema.models.field-user-settings
