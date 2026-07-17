@@ -444,7 +444,8 @@
    :model-imports #{:model/Card
                     :model/Collection
                     :model/Dashboard
-                    :model/Document}}
+                    :model/Document
+                    :model/Exploration}}
 
   bug-reporting
   {:team "UX West"

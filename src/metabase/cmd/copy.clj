@@ -147,6 +147,7 @@
     :model/ExplorationPage
     :model/ExplorationThreadTimeline
     :model/ExplorationQuery
+    :model/ExplorationBookmark
     ;; 63+
     :model/McpFeedback]
    (when config/ee-available?

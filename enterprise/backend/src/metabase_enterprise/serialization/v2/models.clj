@@ -88,6 +88,7 @@
    "DocumentBookmark"
    "Exploration"
    "ExplorationBlock"
+   "ExplorationBookmark"
    "ExplorationPage"
    "ExplorationQuery"
    "ExplorationQueryResult"
