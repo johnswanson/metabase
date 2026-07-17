@@ -1016,7 +1016,9 @@
   {:team "UX West"
    :api  #{metabase.explorations.api
            metabase.explorations.init}
-   :uses #{api
+   :uses #{analytics
+           analytics-interface
+           api
            collections
            events
            lib
@@ -1024,13 +1026,16 @@
            lib-metric
            metrics
            models
+           mq
            queries
            query-processor
            request
+           settings
            util}
    :model-exports #{:model/Exploration}
    :model-imports #{:model/Card
                     :model/Collection
+                    :model/Comment
                     :model/Segment
                     :model/User}}
 
@@ -1483,7 +1488,7 @@
 
   mq
   {:team "UX West"
-   :api  #{metabase.mq.init}
+   :api  #{metabase.mq.core metabase.mq.init}
    :uses #{analytics-interface
            app-db
            classloader
