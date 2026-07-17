@@ -300,17 +300,19 @@
       (mt/with-temporary-setting-values [llm.settings/llm-anthropic-api-key "sk-ant-byok"
                                          llm.settings/llm-proxy-base-url    "https://proxy.example"]
         (testing "Prefers BYOK over ai proxy"
-          (with-redefs [self.core/sse-reducible identity
-                        debug/capture-stream    (fn [r _] r)
-                        http/request            (fn [req] {:body req})]
+          (with-redefs [self.core/sse-reducible             identity
+                        self.core/reducible-with-api-errors (fn [r _ _] r)
+                        debug/capture-stream                (fn [r _] r)
+                        http/request                        (fn [req] {:body req})]
             (is (=? {:method  :post
                      :url     "https://api.anthropic.com/v1/messages"
                      :headers {"x-api-key" "sk-ant-byok"}
                      :body    string?}
                     (claude/claude-raw {:input [{:role :user :content "hi"}]})))))
         (testing "Uses ai proxy when explicitly requested"
-          (with-redefs [llm.settings/llm-anthropic-api-key (constantly nil)
+          (with-redefs [llm.settings/llm-anthropic-api-key  (constantly nil)
                         self.core/sse-reducible             identity
+                        self.core/reducible-with-api-errors (fn [r _ _] r)
                         debug/capture-stream                (fn [r _] r)
                         http/request                        (fn [req] {:body req})]
             (is (=? {:method  :post
