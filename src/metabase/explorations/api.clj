@@ -5,6 +5,7 @@
    [metabase.api.common :as api]
    [metabase.api.macros :as api.macros]
    [metabase.api.routes.common :refer [+auth]]
+   [metabase.app-db.core :as mdb]
    [metabase.collections.models.collection :as collection]
    [metabase.events.core :as events]
    [metabase.explorations.core :as explorations]
@@ -419,6 +420,64 @@
    [:exploration_query_result.interestingness_score            :interestingness_score]
    [:exploration_query_result.contextual_interestingness_score :contextual_interestingness_score]
    [:stored_result.row_count                                    :row_count]])
+
+(defn- get-thread-or-404
+  "Fetch the thread, or 404."
+  [thread-id]
+  (api/check-404 (t2/select-one :model/ExplorationThread :id thread-id)))
+
+(defn- write-check-thread [thread-id]
+  (let [thread (get-thread-or-404 thread-id)]
+    (api/write-check (get-exploration-or-404 (:exploration_id thread)))
+    thread))
+
+(mr/def ::CanceledThread
+  "Schema for the cancel endpoint response — just the state-bearing fields the FE needs to
+  reflect the cancellation. EQ status changes are picked up via the existing `/queries` poll."
+  [:map
+   [:id           ms/PositiveInt]
+   [:canceled_at  [:maybe :any]]])
+
+(api.macros/defendpoint :post "/thread/:thread-id/cancel" :- ::CanceledThread
+  "Cancel an in-flight exploration thread. Stamps `canceled_at` on the thread, and bulk-flips any
+  still-`pending` ExplorationQuery rows to `canceled`. In-flight queries currently mid-QP-execution
+  are left to run to natural completion — their result rows are orphaned but harmless.
+
+  Idempotent: a thread with `canceled_at IS NOT NULL` (already canceled) returns 200 with its
+  existing state. Authorization is the same write check as other thread-mutating endpoints."
+  [{:keys [thread-id]} :- [:map [:thread-id ms/PositiveInt]]]
+  (write-check-thread thread-id)
+  (let [now (t/offset-date-time)]
+    (t2/with-transaction [_conn]
+      ;; CAS gate on `canceled_at IS NULL` makes an already-canceled thread a safe no-op. When this
+      ;; UPDATE matches 0 rows, the thread is already canceled.
+      (t2/update! :model/ExplorationThread
+                  :id          thread-id
+                  :canceled_at nil
+                  {:canceled_at now})
+      ;; Bulk-flip pending → canceled. SKIP LOCKED on Postgres/MySQL skips the row currently
+      ;; held by an in-flight QP worker so this API call doesn't block on QP duration; that row
+      ;; will commit as `done` (or `error`) naturally. H2 has only one worker (see worker-count
+      ;; in the runner) so SKIP LOCKED is unnecessary and unsupported.
+      ;;
+      ;; Done as a select-then-update rather than `WHERE id IN (subquery on the same table)`:
+      ;; MySQL/MariaDB reject updating a table referenced by a subquery in the same statement
+      ;; (error 1093). The selected rows stay locked until the surrounding transaction commits,
+      ;; so the SKIP LOCKED semantics are preserved.
+      (let [pending-ids (map :id
+                             (t2/query
+                              (cond-> {:select [:id]
+                                       :from   [:exploration_query]
+                                       :where  [:and
+                                                [:= :exploration_thread_id thread-id]
+                                                [:= :status "pending"]]}
+                                (not= :h2 (mdb/db-type)) (assoc :for [:update :skip-locked]))))]
+        (when (seq pending-ids)
+          (t2/query
+           {:update (t2/table-name :model/ExplorationQuery)
+            :set    {:status "canceled"}
+            :where  [:in :id pending-ids]})))))
+  (t2/select-one [:model/ExplorationThread :id :canceled_at] :id thread-id))
 
 (api.macros/defendpoint :get "/:id/queries" :- [:sequential ::ExplorationQuerySummary]
   "Lightweight list of queries for an exploration. Excludes `dataset_query` and the result blob —

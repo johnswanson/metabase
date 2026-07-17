@@ -595,3 +595,95 @@
             body (mt/user-http-request u :get 409 (format "exploration/query/%d" qid))]
         (is (= "pending" (:status body)))
         (is (= qid (:id body)))))))
+
+;; ---------------------------- Thread cancellation ----------------------------
+
+(defn- minimal-cancel-fixture!
+  "Create an Exploration + Thread + N pending ExplorationQuery rows owned by `user-id`, sharing a
+  single dummy metric Card. Returns `{:thread-id ..., :eq-ids [...]}`. Cancellation tests don't
+  need the full create flow; this skips planning and result writing entirely."
+  [user-id n]
+  (let [card        (first (t2/insert-returning-instances! :model/Card
+                                                           {:name          "cancel-fixture metric"
+                                                            :type          :metric
+                                                            :creator_id    user-id
+                                                            :database_id   (mt/id)
+                                                            :display       "table"
+                                                            :visualization_settings {}
+                                                            :dataset_query (lib/->legacy-MBQL (let [mp (mt/metadata-provider)] (-> (lib/query mp (lib.metadata/table mp (mt/id :venues))) (lib/aggregate (lib/count)))))}))
+        exploration (first (t2/insert-returning-instances! :model/Exploration
+                                                           {:name       "cancel-fixture"
+                                                            :creator_id user-id}))
+        thread      (first (t2/insert-returning-instances! :model/ExplorationThread
+                                                           {:exploration_id (:id exploration)
+                                                            :position       0
+                                                            :started_at     (t/offset-date-time)}))
+        group-id    (t2/insert-returning-pk! :model/ExplorationBlock
+                                             {:exploration_thread_id (:id thread)})
+        eq-ids      (vec (for [i (range n)]
+                           (let [page-id (t2/insert-returning-pk! :model/ExplorationPage
+                                                                  {:exploration_block_id group-id
+                                                                   :card_id              (:id card)
+                                                                   :dimension_id         (str "d" i)
+                                                                   :query_type           "default"})]
+                             (:id (first (t2/insert-returning-instances! :model/ExplorationQuery
+                                                                         {:exploration_thread_id (:id thread)
+                                                                          :card_id               (:id card)
+                                                                          :database_id           (:database_id card)
+                                                                          :page_id               page-id
+                                                                          :dimension_id          (str "d" i)
+                                                                          :dataset_query         (:dataset_query card)
+                                                                          :status                "pending"
+                                                                          :position              i}))))))]
+    {:thread-id (:id thread) :eq-ids eq-ids}))
+
+(deftest thread-cancel-sets-timestamps-and-flips-pending-test
+  (testing "POST /thread/:id/cancel stamps canceled_at and bulk-flips pending EQs"
+    (mt/with-model-cleanup [:model/ExplorationQuery :model/ExplorationThread :model/Exploration :model/Card]
+      (let [{:keys [thread-id eq-ids]} (minimal-cancel-fixture! (mt/user->id :rasta) 3)
+            resp (mt/user-http-request :rasta :post 200 (str "exploration/thread/" thread-id "/cancel"))]
+        (is (= thread-id (:id resp)))
+        (is (some? (:canceled_at resp)))
+        (let [thread (t2/select-one :model/ExplorationThread :id thread-id)]
+          (is (some? (:canceled_at thread))))
+        (is (every? #(= "canceled" %)
+                    (map :status (t2/select :model/ExplorationQuery :id [:in eq-ids])))
+            "all pending EQs are flipped to canceled")))))
+
+(deftest thread-cancel-idempotent-on-already-canceled-test
+  (testing "cancelling an already-canceled thread is a 200 no-op that returns the existing timestamps"
+    (mt/with-model-cleanup [:model/ExplorationQuery :model/ExplorationThread :model/Exploration :model/Card]
+      (let [{:keys [thread-id]} (minimal-cancel-fixture! (mt/user->id :rasta) 1)
+            first-resp  (mt/user-http-request :rasta :post 200 (str "exploration/thread/" thread-id "/cancel"))
+            second-resp (mt/user-http-request :rasta :post 200 (str "exploration/thread/" thread-id "/cancel"))]
+        (is (= (:canceled_at first-resp) (:canceled_at second-resp))
+            "second cancel must not overwrite the original canceled_at — the CAS WHERE clause matched 0 rows")))))
+
+(deftest thread-cancel-requires-write-perm-test
+  (testing "cancel requires write perm on the parent exploration's collection"
+    (mt/with-non-admin-groups-no-root-collection-perms
+      (mt/with-temp [:model/Collection coll {:name "cancel-restricted"}
+                     :model/Card card {:name          "cancel-perm-fixture"
+                                       :type          :metric
+                                       :creator_id    (mt/user->id :crowberto)
+                                       :dataset_query (lib/->legacy-MBQL (let [mp (mt/metadata-provider)] (-> (lib/query mp (lib.metadata/table mp (mt/id :venues))) (lib/aggregate (lib/count)))))}
+                     :model/Exploration exploration {:name          "cancel-perm-fixture"
+                                                     :creator_id    (mt/user->id :crowberto)
+                                                     :collection_id (:id coll)}
+                     :model/ExplorationThread thread {:exploration_id (:id exploration)
+                                                      :position       0
+                                                      :started_at     (t/offset-date-time)}
+                     :model/ExplorationBlock group {:exploration_thread_id (:id thread)}
+                     :model/ExplorationPage page {:exploration_block_id (:id group) :card_id (:id card)
+                                                  :dimension_id "d1" :query_type "default"}
+                     :model/ExplorationQuery _q {:exploration_thread_id (:id thread)
+                                                 :card_id               (:id card)
+                                                 :page_id               (:id page)
+                                                 :dimension_id          "d1"
+                                                 :dataset_query         (:dataset_query card)
+                                                 :status                "pending"
+                                                 :position              0}]
+        ;; Non-admin groups have no root perms (via the wrapper); the fresh Collection grants none.
+        ;; :rasta (member of All Users only) gets 403; admin :crowberto bypasses collection perms.
+        (mt/user-http-request :rasta :post 403 (str "exploration/thread/" (:id thread) "/cancel"))
+        (mt/user-http-request :crowberto :post 200 (str "exploration/thread/" (:id thread) "/cancel"))))))
