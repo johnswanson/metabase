@@ -1400,7 +1400,6 @@
    :api  #{metabase.metrics.api
            metabase.metrics.core}
    :uses #{api
-           collections
            lib
            lib-be
            lib-metric
@@ -1408,6 +1407,7 @@
            parameters
            permissions
            premium-features
+           queries
            query-processor
            request
            server
@@ -1782,7 +1782,8 @@
   {:team "Graphy"
    :api  #{metabase.queries.core
            metabase.queries.init
-           metabase.queries.models.query ; TODO FIXME
+           metabase.queries.models.card
+           metabase.queries.models.query
            metabase.queries.schema}
    :uses #{analytics
            analytics-interface
