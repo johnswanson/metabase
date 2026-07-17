@@ -139,6 +139,33 @@
              (is (zero? (t2/count :model/ExplorationQueryResult :exploration_query_id qid))
                  "no partial result was written"))))))))
 
+(deftest plan-that-keeps-failing-terminally-stamps-the-thread-test
+  (testing "a plan delivery that fails every attempt ends with the thread terminally stamped — the
+            same state the planner's own failure path writes — so the client stops polling and the
+            failure is recorded, not just logged"
+    (mt/with-temporary-setting-values [queue-max-retries 2]
+      (do-with-fixtures!
+       (fn [{:keys [thread]}]
+         ;; a failure *around* the planner (`generate-query-plan!` catches its own): the thread
+         ;; select blowing up on every delivery stands in for app-DB trouble. `with-redefs`, not
+         ;; `mt/with-dynamic-fn-redefs`: the handler runs on an MQ worker thread, which does not
+         ;; carry this thread's dynamic bindings.
+         #_{:clj-kondo/ignore [:metabase/prefer-with-dynamic-fn-redefs]}
+         (with-redefs [runner/plan-thread! (fn [_] (throw (ex-info "planner infrastructure down" {})))]
+           (mq.tu/with-test-mq [ctx]
+             (t2/with-transaction [_conn]
+               (explorations.queues/start-thread! (:id thread)))
+             (mq.tu/eventually! ctx
+                                #(some? (:completed_at (t2/select-one :model/ExplorationThread
+                                                                      :id (:id thread))))
+                                60000)))
+         (let [after (t2/select-one :model/ExplorationThread :id (:id thread))]
+           (is (some? (:completed_at after))
+               "the thread completes, releasing the client from its polling loop")
+           (is (= :error (:outcome (:query_plan_transcript after)))
+               "and the transcript records why")
+           (is (= "planner infrastructure down" (:error (:query_plan_transcript after))))))))))
+
 (deftest duplicate-delivery-does-not-run-a-query-twice-test
   (testing "at-least-once: with every message delivered twice, a query still runs once and writes
             exactly one result (exploration_query_result is 1:1 with exploration_query)"

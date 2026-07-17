@@ -161,6 +161,61 @@
                  (:id exploration-query))
       nil)))
 
+(defn- claim-analysis-if-ready!
+  "Atomically flip `exploration_thread.analysis_started_at` from NULL to NOW() iff every
+  query on the thread has reached a terminal status (anything other than `pending`).
+  Returns true iff this caller was the one that claimed it — the unique caller who should
+  run the handler. The matching `completed_at` flip happens later, after the handler finishes."
+  [thread-id]
+  (pos?
+   (t2/query-one
+    {:update :exploration_thread
+     :set    {:analysis_started_at (OffsetDateTime/now)}
+     :where  [:and
+              [:= :id thread-id]
+              [:= :analysis_started_at nil]
+              [:= :canceled_at nil]
+              [:not-exists {:select [1]
+                            :from   [:exploration_query]
+                            :where  [:and
+                                     [:= :exploration_thread_id thread-id]
+                                     [:= :status "pending"]]}]]})))
+
+(defn- mark-thread-fully-completed!
+  "Set `completed_at` to NOW(). This is what the UI polls on to decide it's done
+  watching the thread."
+  [thread-id]
+  (t2/update! :model/ExplorationThread thread-id {:completed_at (OffsetDateTime/now)}))
+
+(defn- on-thread-completed
+  "Single entry point for post-completion work. Always invoked with `thread-id` (a long)
+  exactly once per thread, on a background daemon thread. Runs after the runner's row
+  transaction has committed, so it's free to do its own DB I/O.
+
+  Stamps `completed_at` so the UI's polling loop sees a clean done signal."
+  [thread-id]
+  (log/infof "Exploration thread %d: queries+scoring done" thread-id)
+  (try
+    (mark-thread-fully-completed! thread-id)
+    (catch Throwable e
+      (log/errorf e "Failed to set completed_at for thread %d" thread-id))))
+
+(defn maybe-complete-thread!
+  "Invoke after any state transition that could be the last unit of work for `thread-id`
+  (a query reaching a terminal status). If this call is the one that claims the analysis
+  run, runs `on-thread-completed` on a background `future`. Safe to call repeatedly:
+  subsequent calls are no-ops thanks to the `analysis_started_at IS NULL` predicate.
+
+  `thread-id` may be nil (e.g. the runner couldn't resolve the thread for a now-deleted
+  query); in that case this is a no-op."
+  [thread-id]
+  (when (and thread-id (claim-analysis-if-ready! thread-id))
+    (future
+      (try
+        (on-thread-completed thread-id)
+        (catch Throwable e
+          (log/errorf e "on-thread-completed failed for thread %d" thread-id))))))
+
 (defn- exploration-creator-id
   "Walk EQ → ExplorationThread → Exploration.creator_id for stamping onto the stored_result."
   [exploration-query]
@@ -414,7 +469,7 @@
 (defn plan-thread!
   "Run the LLM planner for `thread-id`, materializing its `ExplorationQuery` rows. Idempotent for MQ."
   [thread-id]
-  (let [thread   (t2/select-one [:model/ExplorationThread :id :canceled_at] :id thread-id)
+  (let [thread   (t2/select-one [:model/ExplorationThread :id :canceled_at :analysis_started_at] :id thread-id)
         planned? (cond
                    ;; `restart` deletes and re-creates a thread's work; a message for a thread that
                    ;; no longer exists is a no-op.
@@ -425,6 +480,15 @@
                    ;; spend an LLM call on work nobody is waiting for.
                    (:canceled_at thread)
                    (do (log/infof "Exploration thread %d was canceled; skipping planning" thread-id)
+                       false)
+
+                   ;; A plan that produced no queries completes its thread without inserting any
+                   ;; ExplorationQuery rows, so the row-existence check below can't tell it apart from
+                   ;; a never-planned thread. `analysis_started_at` — claimed once, synchronously,
+                   ;; when the thread has no pending work — catches that case, so a redelivered plan
+                   ;; message can't re-run the planner and resurrect a completed exploration.
+                   (:analysis_started_at thread)
+                   (do (log/infof "Exploration thread %d already completed its analysis; skipping planning" thread-id)
                        false)
 
                    (t2/exists? :model/ExplorationQuery :exploration_thread_id thread-id)

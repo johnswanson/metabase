@@ -774,6 +774,36 @@ databaseChangeLog:
             onDelete: CASCADE
 
   - changeSet:
+      id: v64.g4ersd
+      author: nvoxland
+      comment: Add exploration_thread.completed_at
+      changes:
+        - addColumn:
+            tableName: exploration_thread
+            columns:
+              - column:
+                  name: completed_at
+                  type: ${timestamp_type}
+                  remarks: Set once when every query in the thread has reached a terminal status (done or error). Used as a CAS gate so completion handlers fire exactly once.
+                  constraints:
+                    nullable: true
+
+  - changeSet:
+      id: v64.startedat
+      author: nvoxland
+      comment: Add exploration_thread.analysis_started_at
+      changes:
+        - addColumn:
+            tableName: exploration_thread
+            columns:
+              - column:
+                  name: analysis_started_at
+                  type: ${timestamp_type}
+                  remarks: Set once when every query in the thread has reached a terminal status. CAS gate that ensures the auto-insights handler fires exactly once per thread. completed_at is set later, when the handler finishes.
+                  constraints:
+                    nullable: true
+
+  - changeSet:
       id: v64.sruse
       author: nvoxland
       comment: Create stored_result_use table tracking what references a stored_result
