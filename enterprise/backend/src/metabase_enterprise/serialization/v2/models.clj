@@ -152,6 +152,8 @@
    "SourceSegmentCompositeDaily"
    "SourceSegmentDaily"
    "SsoRelayState"
+   "StoredResult"
+   "StoredResultUse"
    "SupportAccessGrantLog"
    "TableRemapping"
    "TaskHistory"

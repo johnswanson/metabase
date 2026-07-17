@@ -65,6 +65,8 @@
     :model/SourceSegmentCompositeDaily
     :model/SourceSegmentDaily
     :model/SsoRelayState
+    :model/StoredResult
+    :model/StoredResultUse
     :model/SupportAccessGrantLog
     :model/TableIndex
     :model/TaskHistory
