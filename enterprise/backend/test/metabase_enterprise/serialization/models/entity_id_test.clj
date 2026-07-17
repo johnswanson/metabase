@@ -62,6 +62,8 @@
     :model/DocumentBookmark
     :model/Exploration
     :model/ExplorationThread
+    :model/ExplorationBlock
+    :model/ExplorationPage
     :model/CollectionPermissionGraphRevision
     :model/DashboardCardSeries
     :model/LoginHistory

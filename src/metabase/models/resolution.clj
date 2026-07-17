@@ -49,6 +49,8 @@
     :model/DocumentBookmark                  metabase.bookmarks.models.bookmark
     :model/EmbeddingTheme                    metabase.embedding.models.theme
     :model/Exploration                       metabase.explorations.models.exploration
+    :model/ExplorationBlock                  metabase.explorations.models.exploration-block
+    :model/ExplorationPage                   metabase.explorations.models.exploration-page
     :model/ExplorationThread                 metabase.explorations.models.exploration-thread
     :model/Field                             metabase.warehouse-schema.models.field
     :model/FieldUserSettings                 metabase.warehouse-schema.models.field-user-settings

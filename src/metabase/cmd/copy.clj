@@ -143,6 +143,8 @@
     ;; 62+
     :model/Exploration
     :model/ExplorationThread
+    :model/ExplorationBlock
+    :model/ExplorationPage
     ;; 63+
     :model/McpFeedback]
    (when config/ee-available?
