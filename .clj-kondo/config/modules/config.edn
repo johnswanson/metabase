@@ -609,6 +609,7 @@
                     :model/DashboardCard
                     :model/DashboardCardSeries
                     :model/Document
+                    :model/Exploration
                     :model/NativeQuerySnippet
                     :model/Permissions
                     :model/Pulse
@@ -643,6 +644,7 @@
                     :model/Collection
                     :model/Dashboard
                     :model/Document
+                    :model/Exploration
                     :model/NativeQuerySnippet
                     :model/Pulse
                     :model/Table
@@ -693,6 +695,14 @@
            util}
    :model-exports #{:model/ModerationReview}
    :model-imports #{:model/Card :model/Dashboard}}
+
+  contextual-interestingness
+  {:team "UX West"
+   :api  #{}
+   :uses #{interestingness
+           metabot
+           query-processor
+           util}}
 
   core
   {:team "UX West"
