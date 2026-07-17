@@ -1002,6 +1002,20 @@
                     :model/Table
                     :model/User}}
 
+  explorations
+  {:team "UX West"
+   :api  #{metabase.explorations.api
+           metabase.explorations.init}
+   :uses #{api
+           collections
+           events
+           models
+           request
+           util}
+   :model-exports #{:model/Exploration}
+   :model-imports #{:model/Collection
+                    :model/User}}
+
   formatter
   {:team "UX West"
    :api  #{metabase.formatter.core}
@@ -1981,6 +1995,7 @@
                     :model/DashboardCard
                     :model/DashboardTab
                     :model/Document
+                    :model/Exploration
                     :model/Measure
                     :model/Segment
                     :model/Transform}}

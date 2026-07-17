@@ -140,6 +140,9 @@
     :model/MetabotUsedTable
     :model/MetabotPrompt
     :model/OsiAiContext
+    ;; 62+
+    :model/Exploration
+    :model/ExplorationThread
     ;; 63+
     :model/McpFeedback]
    (when config/ee-available?
