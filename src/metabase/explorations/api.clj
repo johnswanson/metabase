@@ -9,11 +9,18 @@
    [metabase.events.core :as events]
    [metabase.explorations.core :as explorations]
    [metabase.explorations.models.exploration :as expl.model]
+   [metabase.explorations.models.exploration-query-result :as eqr]
    [metabase.explorations.queues :as explorations.queues]
+   [metabase.queries.core :as queries]
+   [metabase.query-processor.core :as qp]
+   [metabase.query-processor.pipeline :as qp.pipeline]
+   [metabase.query-processor.streaming :as qp.streaming]
    [metabase.request.core :as request]
    [metabase.util.malli.registry :as mr]
    [metabase.util.malli.schema :as ms]
-   [toucan2.core :as t2]))
+   [toucan2.core :as t2])
+  (:import
+   (java.io ByteArrayInputStream)))
 
 (set! *warn-on-reflection* true)
 
@@ -80,6 +87,48 @@
    [:threads       {:optional true} [:maybe [:sequential ::HydratedThread]]]
    [:created_at    {:optional true} [:maybe :any]]
    [:updated_at    {:optional true} [:maybe :any]]])
+
+(mr/def ::ExplorationQuerySummary
+  "Schema for a query row in API responses. The result blob and `dataset_query` aren't
+   asserted here; `interestingness_score`, `contextual_interestingness_score`, and
+   `row_count` are left-joined (in `/:id/queries`) or batched-hydrated (in `/:id`) — the
+   scores from `exploration_query_result`, `row_count` from the linked `stored_result` —
+   and may be nil for pending/errored queries or — for the contextual score — when the LLM
+   is unconfigured or the thread had no prompt."
+  [:map
+   [:id                               ms/PositiveInt]
+   [:exploration_thread_id            ms/PositiveInt]
+   [:card_id                          ms/PositiveInt]
+   [:segment_id                       {:optional true} [:maybe ms/PositiveInt]]
+   [:segment_name                     {:optional true} [:maybe :string]]
+   [:dimension_id                     [:maybe :string]]
+   [:dimension_name                   {:optional true} :string]
+   [:query_type                       :string]
+   [:display                          {:optional true} [:maybe :string]]
+   [:name                             {:optional true} [:maybe :string]]
+   [:position                         ms/IntGreaterThanOrEqualToZero]
+   [:status                           :string]
+   [:error_message                    {:optional true} [:maybe :string]]
+   [:started_at                       {:optional true} [:maybe :any]]
+   [:finished_at                      {:optional true} [:maybe :any]]
+   [:entity_id                        {:optional true} [:maybe :string]]
+   [:interestingness_score            {:optional true} [:maybe number?]]
+   [:contextual_interestingness_score {:optional true} [:maybe number?]]
+   [:row_count                        {:optional true} [:maybe ms/IntGreaterThanOrEqualToZero]]])
+
+(mr/def ::ExplorationQueryStreamResponse
+  "Schema for `GET /query/:id`. On success the body is a streamed dataset (api/csv/json/xlsx),
+   so we describe it as `:any`. On a not-yet-done query we return a 409 with a status payload."
+  [:or
+   :any
+   [:map
+    [:status [:= 409]]
+    [:body   [:map
+              [:id            ms/PositiveInt]
+              [:status        :string]
+              [:error_message {:optional true} [:maybe :string]]
+              [:started_at    {:optional true} [:maybe :any]]
+              [:finished_at   {:optional true} [:maybe :any]]]]]])
 
 (mr/def ::ExplorationSummary
   "Lightweight row for the `GET /mine` list. No threads/queries — just the metadata
@@ -354,6 +403,90 @@
     (api/write-check existing)
     (t2/delete! :model/Exploration :id id))
   nil)
+
+(def ^:private query-summary-columns
+  "Column projection for `::ExplorationQuerySummary` rows — excludes `dataset_query` and the
+  result blob, joins both interestingness scores from `exploration_query_result` and the
+  snapshot `row_count` from `stored_result` (reached through the EQR FK — callers must
+  left-join both tables)."
+  [:exploration_query.id :exploration_query.exploration_thread_id
+   :exploration_query.card_id :exploration_query.segment_id
+   :exploration_query.dimension_id :exploration_query.query_type
+   :exploration_query.name :exploration_query.position
+   :exploration_query.status :exploration_query.error_message
+   :exploration_query.started_at :exploration_query.finished_at
+   :exploration_query.entity_id
+   [:exploration_query_result.interestingness_score            :interestingness_score]
+   [:exploration_query_result.contextual_interestingness_score :contextual_interestingness_score]
+   [:stored_result.row_count                                    :row_count]])
+
+(api.macros/defendpoint :get "/:id/queries" :- [:sequential ::ExplorationQuerySummary]
+  "Lightweight list of queries for an exploration. Excludes `dataset_query` and the result blob —
+  intended for the frontend to poll while pending queries finish. The `interestingness_score`
+  column is left-joined from `exploration_query_result` so clients can rank/highlight without a
+  second roundtrip; pending or errored queries get `nil`."
+  [{:keys [id]} :- [:map [:id ms/PositiveInt]]]
+  (api/read-check (get-exploration-or-404 id))
+  (t2/hydrate
+   (t2/select (into [:model/ExplorationQuery] query-summary-columns)
+              {:left-join [:exploration_thread
+                           [:= :exploration_query.exploration_thread_id :exploration_thread.id]
+                           :exploration_query_result
+                           [:= :exploration_query_result.exploration_query_id :exploration_query.id]
+                           :stored_result
+                           [:= :stored_result.id :exploration_query_result.stored_result_id]]
+               :where     [:= :exploration_thread.exploration_id id]
+               :order-by  [[:exploration_query.position :asc]
+                           [:exploration_query.id :asc]]})
+   :segment_name))
+
+(defn- get-exploration-query-or-404
+  "Fetch an `ExplorationQuery` by id and read-check it. The model's `can-read?` delegates up
+  through `ExplorationThread` to the parent `Exploration`."
+  [query-id]
+  (api/read-check (api/check-404 (t2/select-one :model/ExplorationQuery :id query-id))))
+
+(defn- stream-stored-result
+  "Replay a worker-serialized QP result (gzipped+nippy bytes from `:model/StoredResult.result_data`)
+  through the streaming pipeline so the response is shaped like a normal `/api/dataset` response.
+  Reuses
+  `qp/with-reducible-deserialized-results` — the same machinery the cache middleware
+  uses to replay cached results."
+  [export-format ^bytes result-bytes]
+  (qp.streaming/streaming-response [rff export-format]
+    (qp/with-reducible-deserialized-results
+      [[qp-result _] (ByteArrayInputStream. result-bytes)]
+      (when qp-result
+        (let [data (:data qp-result)]
+          (qp.pipeline/*reduce* rff
+                                (dissoc data :rows)
+                                (or (:rows data) [])))))))
+
+(api.macros/defendpoint :get "/query/:id" :- ::ExplorationQueryStreamResponse
+  "Stream the result of a single completed exploration query. The optional `format` query param
+  is one of `api`, `json`, `csv`, `xlsx` (default `api`). When the underlying query is still
+  pending or has errored, returns a 409 with status info instead of streaming."
+  [{:keys [id]}     :- [:map [:id ms/PositiveInt]]
+   {:keys [format]} :- [:map
+                        [:format {:default :api}
+                         [:enum {:decode/api keyword} :api :csv :json :xlsx]]]]
+  (let [q (get-exploration-query-or-404 id)]
+    (case (:status q)
+      "done"
+      (let [sr (api/check-404 (eqr/stored-results id))]
+        ;; The cached `result_data` was produced under the creator's lens, so a non-creator viewer
+        ;; might otherwise see rows the QP would have filtered out for them. Gate against the
+        ;; creator's stored data-access token (sandbox/impersonation/routing) + basic data perms.
+        (when-not (= api/*current-user-id* (:creator_id sr))
+          (queries/assert-can-view-cached-result! sr))
+        (stream-stored-result format (:result_data sr)))
+
+      ;; Pending / errored: no blob exists yet and the response is status-only (no rows, no
+      ;; derived text), so it carries no data to leak — it rides the exploration's collection
+      ;; perms (already enforced by `get-exploration-query-or-404`'s read-check), like seeing a
+      ;; dashboard card that's still loading.
+      {:status 409
+       :body   (select-keys q [:id :status :error_message :started_at :finished_at])})))
 
 ;;; ----------------------------------------- routes -----------------------------------------
 

@@ -62,6 +62,7 @@
     :model/DocumentBookmark
     :model/Exploration
     :model/ExplorationQuery
+    :model/ExplorationQueryResult
     :model/ExplorationThread
     :model/ExplorationBlock
     :model/ExplorationPage

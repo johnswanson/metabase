@@ -4,11 +4,15 @@
    [java-time.api :as t]
    [metabase.collections.models.collection :as collection]
    [metabase.config.core :as config]
+   [metabase.explorations.query-plan :as query-plan]
+   [metabase.explorations.query-plan.context :as qp.context]
+   [metabase.explorations.query-plan.variants :as qp.variants]
    [metabase.lib.core :as lib]
    [metabase.lib.metadata :as lib.metadata]
    [metabase.permissions.core :as perms]
    [metabase.permissions.models.permissions-group :as perms-group]
    [metabase.queries.models.card :as card]
+   [metabase.query-processor.core :as qp.core]
    [metabase.test :as mt]
    [metabase.test.fixtures :as fixtures]
    [toucan2.core :as t2]))
@@ -173,6 +177,54 @@
   {:type          :metric
    :creator_id    user-id
    :dataset_query (lib/->legacy-MBQL (let [mp (mt/metadata-provider)] (-> (lib/query mp (lib.metadata/table mp (mt/id :venues))) (lib/aggregate (lib/count)))))})
+
+(defn- ->blocks-body
+  "Adapt a test body that uses top-level `:metrics`/`:dimensions` into the `:blocks` payload
+  the API now requires, wrapping them in a single block. Bodies that already carry `:blocks`
+  pass through. Lets the existing create-test suite express a metric×dimension selection
+  without block boilerplate; `:timeline_ids` stays thread-scoped at the top level."
+  [{:keys [metrics dimensions blocks] :as body}]
+  (if blocks
+    body
+    (-> body
+        (dissoc :metrics :dimensions)
+        (assoc :blocks [{:type "metric" :metrics metrics :dimensions dimensions}]))))
+
+(defn- finalize-queries!
+  "For each query whose planner deferred the MBQL build (nil `:dataset_query`), resolve the row
+  context and persist the MBQL dataset_query using the same variant machinery the production
+  runner uses. This replicates the `finalize-row!` step from the async runner (which doesn't
+  execute in the test environment)."
+  [queries]
+  (doseq [q queries
+          :when (nil? (:dataset_query q))]
+    (when-let [ctx (qp.context/build-row-context q)]
+      (when-let [dq (qp.variants/dataset-query (:query_type q) ctx)]
+        (t2/update! :model/ExplorationQuery (:id q)
+                    {:dataset_query dq})))))
+
+(defn- thread-queries
+  "The queries of `thread-id`, in position order — the shape the async runner materializes and the
+  hydrated response later attaches to each thread."
+  [thread-id]
+  (t2/select :model/ExplorationQuery
+             :exploration_thread_id thread-id
+             {:order-by [[:position :asc] [:id :asc]]}))
+
+(defn- create-exploration!
+  "POST a new exploration as `user`, then synchronously run the query planner for each created
+  thread (production does this in an async worker that doesn't run in tests). Also finalizes each
+  query's dataset_query (production does this in the runner's per-row execution step). Returns the
+  re-hydrated exploration with each thread's materialized `:queries` attached."
+  [user body]
+  (let [resp (mt/user-http-request user :post 200 "exploration" (->blocks-body body))]
+    (doseq [thread (:threads resp)]
+      (query-plan/generate-query-plan! (:id thread)))
+    (finalize-queries! (mapcat (comp thread-queries :id) (:threads resp)))
+    (let [expl (mt/user-http-request user :get 200 (str "exploration/" (:id resp)))]
+      (update expl :threads
+              (fn [threads]
+                (mapv #(assoc % :queries (thread-queries (:id %))) threads))))))
 
 (deftest exploration-create-persists-blocks-verbatim-test
   (testing "POST / persists each :blocks entry as its own ExplorationBlock row — no dedup across blocks"
@@ -420,3 +472,126 @@
           (is (nil? (:limit resp)))
           (is (nil? (:offset resp)))
           (is (= 3 (count (:data resp)))))))))
+
+(deftest exploration-list-queries-endpoint-test
+  (testing "GET /:id/queries returns lightweight summaries without dataset_query"
+    (mt/with-temp [:model/User u {:email "list@example.com"}
+                   :model/Card metric (valid-metric-card (:id u))]
+      (let [resp (create-exploration! u
+                                      {:name "list"
+                                       :metrics [{:card_id (:id metric)
+                                                  :dimension_mappings [{:dimension_id "d1" :table_id 1 :target ["field" {} 1]}]}]
+                                       :dimensions [{:dimension_id "d1"}]})
+            eid       (:id resp)
+            summaries (mt/user-http-request u :get 200 (format "exploration/%d/queries" eid))]
+        (is (= 1 (count summaries)))
+        (let [s (first summaries)]
+          (is (contains? s :status))
+          (is (= "pending" (:status s)))
+          (is (contains? s :position))
+          (is (not (contains? s :dataset_query)) "dataset_query must not leak")
+          (is (not (contains? s :result_data)) "result blob must not leak")
+          (is (contains? s :interestingness_score) "score is included via the result-table left-join")
+          (is (nil? (:interestingness_score s)) "pending queries have no result row, hence nil score")
+          (is (contains? s :contextual_interestingness_score)
+              "contextual score is included via the result-table left-join")
+          (is (nil? (:contextual_interestingness_score s))
+              "pending queries have no result row, hence nil contextual score")
+          (is (contains? s :row_count) "row_count is included via the result-table left-join")
+          (is (nil? (:row_count s)) "pending queries have no result row, hence nil row_count"))))))
+
+(deftest exploration-list-queries-includes-score-from-result-test
+  (testing "GET /:id/queries surfaces both interestingness scores via the result-table left-join"
+    (mt/with-temp [:model/User u {:email "score-list@example.com"}
+                   :model/Card metric (valid-metric-card (:id u))]
+      (let [resp (create-exploration! u
+                                      {:name "score-list"
+                                       :metrics [{:card_id (:id metric)
+                                                  :dimension_mappings [{:dimension_id "d1" :table_id 1 :target ["field" {} 1]}]}]
+                                       :dimensions [{:dimension_id "d1"}]})
+            eid (:id resp)
+            qid (-> resp :threads first :queries first :id)]
+        (let [sr-id (first (t2/insert-returning-pks! :model/StoredResult
+                                                     {:result_data (byte-array [0])
+                                                      :row_count   37}))]
+          (t2/insert! :model/ExplorationQueryResult
+                      {:exploration_query_id             qid
+                       :stored_result_id                 sr-id
+                       :interestingness_score            0.42
+                       :contextual_interestingness_score 0.83}))
+        (let [s (-> (mt/user-http-request u :get 200 (format "exploration/%d/queries" eid)) first)]
+          (is (= 0.42 (:interestingness_score s)))
+          (is (= 0.83 (:contextual_interestingness_score s)))
+          (is (= 37 (:row_count s)) "row_count surfaces from the linked stored_result"))))))
+
+(deftest exploration-list-queries-permissions-test
+  (testing "GET /:id/queries enforces the same read-check as the parent exploration"
+    (mt/with-temp [:model/User owner {:email "lq-owner@example.com"}
+                   :model/User other {:email "lq-other@example.com"}]
+      (let [{eid :id} (mt/user-http-request owner :post 200 "exploration"
+                                            {:name "lq-private"
+                                             :collection_id (:id (collection/user->personal-collection (:id owner)))})]
+        (mt/user-http-request other :get 403 (format "exploration/%d/queries" eid))))))
+
+(defn- store-fake-result!
+  "Insert a StoredResult holding the worker-serialized bytes plus an ExplorationQueryResult
+  that points at it, mirroring what the runner produces so the read endpoints can replay it.
+  Stamps `creator_id` from the owning Exploration (as the real runner does) so the cached-read
+  gate's creator bypass behaves like production."
+  [query-id qp-result]
+  (let [bytes      (qp.core/do-with-serialization
+                    (fn [in result-fn]
+                      (in qp-result)
+                      (result-fn)))
+        creator-id (t2/select-one-fn :creator_id :model/Exploration
+                                     {:select [:e.creator_id]
+                                      :from   [[:exploration :e]]
+                                      :join   [[:exploration_thread :t] [:= :t.exploration_id :e.id]
+                                               [:exploration_query :q]  [:= :q.exploration_thread_id :t.id]]
+                                      :where  [:= :q.id query-id]})
+        sr-id      (first (t2/insert-returning-pks!
+                           :model/StoredResult
+                           {:result_data bytes
+                            :creator_id  creator-id}))]
+    (t2/insert! :model/ExplorationQueryResult
+                {:exploration_query_id query-id
+                 :stored_result_id     sr-id})))
+
+(defn- mark-done! [query-id]
+  (t2/update! :model/ExplorationQuery query-id {:status "done"}))
+
+(deftest exploration-query-result-streams-stored-result-test
+  (testing "GET /query/:id streams the stored worker result as JSON"
+    (mt/with-temp [:model/User u {:email "result@example.com"}
+                   :model/Card metric (valid-metric-card (:id u))]
+      (let [resp     (create-exploration! u
+                                          {:name "result"
+                                           :metrics [{:card_id (:id metric)
+                                                      :dimension_mappings [{:dimension_id "d1" :table_id 1 :target ["field" {} 1]}]}]
+                                           :dimensions [{:dimension_id "d1"}]})
+            qid      (-> resp :threads first :queries first :id)
+            qp-out   {:status :completed
+                      :data   {:cols [{:name "x"} {:name "y"}]
+                               :rows [["a" 1] ["b" 2]]}
+                      :row_count 2}]
+        (store-fake-result! qid qp-out)
+        (mark-done! qid)
+        (let [body (mt/user-http-request u :get 202 (format "exploration/query/%d" qid))]
+          (is (= [["a" 1] ["b" 2]] (-> body :data :rows))
+              "rows from the stored qp-result are streamed back")
+          (is (= [{:name "x"} {:name "y"}] (-> body :data :cols))
+              "cols metadata round-trips through the streaming rff"))))))
+
+(deftest exploration-query-result-409-when-not-done-test
+  (testing "GET /query/:id returns 409 with status info while the query is still pending"
+    (mt/with-temp [:model/User u {:email "pending@example.com"}
+                   :model/Card metric (valid-metric-card (:id u))]
+      (let [resp (create-exploration! u
+                                      {:name "pending"
+                                       :metrics [{:card_id (:id metric)
+                                                  :dimension_mappings [{:dimension_id "d1" :table_id 1 :target ["field" {} 1]}]}]
+                                       :dimensions [{:dimension_id "d1"}]})
+            qid  (-> resp :threads first :queries first :id)
+            body (mt/user-http-request u :get 409 (format "exploration/query/%d" qid))]
+        (is (= "pending" (:status body)))
+        (is (= qid (:id body)))))))

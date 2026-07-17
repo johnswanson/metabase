@@ -1021,22 +1021,28 @@
            api
            collections
            events
+           interestingness
            lib
            lib-be
            lib-metric
            metrics
            models
            mq
+           permissions
            queries
+           query-permissions
            query-processor
            request
            settings
+           types
            util}
    :model-exports #{:model/Exploration}
    :model-imports #{:model/Card
                     :model/Collection
                     :model/Comment
                     :model/Segment
+                    :model/StoredResult
+                    :model/StoredResultUse
                     :model/User}}
 
   formatter
@@ -1836,7 +1842,9 @@
    :model-exports #{:model/Card
                     :model/Query
                     :model/QueryExecution
-                    :model/QueryTable}
+                    :model/QueryTable
+                    :model/StoredResult
+                    :model/StoredResultUse}
    :model-imports #{:model/Action
                     :model/CardBookmark
                     :model/Collection
