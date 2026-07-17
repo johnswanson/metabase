@@ -1019,12 +1019,16 @@
    :uses #{api
            collections
            events
+           lib
+           lib-be
+           lib-metric
+           metrics
            models
+           queries
            request
            util}
    :model-exports #{:model/Exploration}
-   :model-imports #{:model/Collection
-                    :model/User}}
+   :model-imports #{:model/Card :model/Collection :model/User}}
 
   formatter
   {:team "UX West"
