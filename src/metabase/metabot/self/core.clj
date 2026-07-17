@@ -787,6 +787,24 @@
                          :exception-class exception-class}
                         e))))))
 
+(defn reducible-with-api-errors
+  "Wrap a reducible stream so exceptions thrown during its (lazy) consumption are
+  routed through [[rethrow-api-error!]], the same translation applied to
+  request-time failures. Provider adapters consume their SSE body outside the
+  request `try` (the reduction happens later, in the agent loop), so a
+  mid-stream failure — e.g. a `SocketTimeoutException` between chunks — would
+  otherwise surface raw instead of in the provider-friendly error shape.
+
+  Takes the reducible first so adapters can thread it straight off
+  [[sse-reducible]]/`capture-stream` with `->`."
+  [reducible provider res->message]
+  (reify clojure.lang.IReduceInit
+    (reduce [_ rf init]
+      (try
+        (reduce rf init reducible)
+        (catch Exception e
+          (rethrow-api-error! provider res->message e))))))
+
 (defn missing-api-key-ex
   "Create a standardized missing-API-key exception for provider adapters."
   [llm-type]
@@ -811,9 +829,28 @@
       (or auth
           (throw (missing-api-key-ex llm-type))))))
 
+(def ^:private ^:const default-connection-timeout-ms
+  "TCP connect timeout for an LLM HTTP request. A provider that's down or
+  unreachable should fail fast instead of holding a worker thread forever."
+  10000)
+
+(def ^:private ^:const default-socket-timeout-ms
+  "Inter-byte read timeout for an LLM HTTP request. Anthropic streams responses,
+  so this is the gap between successive chunks (NOT total response time). Picked
+  generously: extended thinking can pause for tens of seconds between thinking
+  chunks. Without this, a hung TLS read inside the stream blocks the worker
+  indefinitely — observed in production when an upstream proxy held the
+  connection open without sending data."
+  120000)
+
 (defn request
-  "Perform an LLM HTTP request with the given auth (a map of `:url` and `:headers`)."
+  "Perform an LLM HTTP request with the given auth (a map of `:url` and `:headers`).
+  Forces a connection + socket timeout on every request so a hung upstream can
+  never block the caller forever. Callers can override either timeout by
+  passing `:connection-timeout` / `:socket-timeout` in `req`."
   [{:keys [url headers]} req]
-  (http/request (-> req
+  (http/request (-> {:connection-timeout default-connection-timeout-ms
+                     :socket-timeout     default-socket-timeout-ms}
+                    (merge req)
                     (update :url #(str url %))
                     (update :headers merge headers))))
