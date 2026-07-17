@@ -224,6 +224,21 @@
                     #'tools/create-alert-tool
                     #'tools/slackbot-create-dashboard-subscription-tool]})
 
+(register-profile!
+ {:name            :explorations
+  :prompt-template "explorations.selmer"
+  :max-iterations  10
+  :temperature     0.3
+  :tools           [#'tools/search-tool
+                    #'tools/read-resource-tool
+                    #'tools/get-research-candidates-tool
+                    #'tools/add-research-groups-tool
+                    #'tools/remove-from-research-plan-tool
+                    #'tools/set-exploration-name-tool
+                    #'tools/list-timelines-tool
+                    #'tools/get-timeline-details-tool
+                    #'tools/select-exploration-timelines-tool]})
+
 (defn- filter-by-capabilities
   "Filter tool vars by user capabilities.
   Removes tools that require capabilities the user doesn't have.

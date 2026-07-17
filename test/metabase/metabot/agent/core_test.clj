@@ -824,4 +824,8 @@
       (testing "document-generate-content profile"
         (is (thrown-with-msg? clojure.lang.ExceptionInfo #"permission"
                               (check! :document-generate-content {:permission/metabot :yes :permission/metabot-other-tools :no})))
-        (is (nil? (check! :document-generate-content {:permission/metabot :yes :permission/metabot-other-tools :yes})))))))
+        (is (nil? (check! :document-generate-content {:permission/metabot :yes :permission/metabot-other-tools :yes}))))
+      (testing "explorations profile (gated on NLQ permission)"
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"permission"
+                              (check! :explorations {:permission/metabot :yes :permission/metabot-nlq :no})))
+        (is (nil? (check! :explorations {:permission/metabot :yes :permission/metabot-nlq :yes})))))))
