@@ -687,3 +687,127 @@
         ;; :rasta (member of All Users only) gets 403; admin :crowberto bypasses collection perms.
         (mt/user-http-request :rasta :post 403 (str "exploration/thread/" (:id thread) "/cancel"))
         (mt/user-http-request :crowberto :post 200 (str "exploration/thread/" (:id thread) "/cancel"))))))
+
+(deftest exploration-restart-reruns-existing-thread-test
+  (testing "POST /thread/:thread-id/restart re-runs that thread in place, keeping selections"
+    (mt/with-temp [:model/User u {:email "restart@example.com"}
+                   :model/Card metric (valid-metric-card (:id u))]
+      (let [body      {:name         "Why is revenue down"
+                       :prompt       "break down by region"
+                       :metrics      [{:card_id (:id metric)
+                                       :dimension_mappings [{:dimension_id "d1"
+                                                             :table_id (mt/id :venues)
+                                                             :target ["field" {} (mt/id :venues :price)]}]}]
+                       :dimensions   [{:dimension_id "d1" :display_name "Price"
+                                       :effective_type "type/Number"}]}
+            created   (create-exploration! u body)
+            expl-id   (:id created)
+            thread    (-> created :threads first)
+            orig-tid  (:id thread)]
+        (is (pos? (count (:queries thread))) "the first run materialized queries")
+        ;; Simulate a finished run so we can prove restart clears the terminal-state gates.
+        (t2/update! :model/ExplorationThread orig-tid
+                    {:query_plan_started_at (t/offset-date-time)
+                     :canceled_at           (t/offset-date-time)})
+        (let [resp     (mt/user-http-request u :post 200 (format "exploration/thread/%d/restart" orig-tid))
+              threads  (:threads resp)
+              rerun    (first threads)]
+          (is (= 1 (count threads)) "restart does NOT add a thread")
+          (is (= orig-tid (:id rerun)) "it re-runs the same thread")
+          (is (some? (:started_at rerun)) "started_at re-stamped so the planner re-claims it")
+          (is (nil? (:query_plan_started_at rerun)) "plan-claim gate cleared")
+          (is (nil? (:canceled_at rerun)) "terminal gate cleared")
+          (is (empty? (:queries rerun)) "previously generated queries are wiped")
+          (testing "selections are preserved"
+            ;; Selections live in the thread's ExplorationBlock rows, which restart does
+            ;; NOT delete (only the materialized queries are wiped, so the query-derived
+            ;; :blocks tree in the response has empty pages until the planner re-runs below).
+            (let [blocks (t2/select :model/ExplorationBlock :exploration_thread_id orig-tid)]
+              (is (= 1 (count blocks)) "the Research-plan block survives the restart")
+              (is (= 1 (count (:metrics (first blocks)))) "its metric selection is preserved")
+              (is (= ["d1"] (mapv :dimension_id (:dimensions (first blocks))))
+                  "its dimension selection is preserved")))
+          (testing "the planner regenerates queries for the same thread"
+            (query-plan/generate-query-plan! orig-tid)
+            (let [hydrated (mt/user-http-request u :get 200 (format "exploration/%d" expl-id))
+                  planned  (-> hydrated :threads first)]
+              (is (= orig-tid (:id planned)))
+              (is (pos? (t2/count :model/ExplorationQuery :exploration_thread_id orig-tid))))))))))
+
+(deftest exploration-restart-permissions-test
+  (testing "Only a user with write access can restart an exploration"
+    (mt/with-temp [:model/User owner {:email "rs-owner@example.com"}
+                   :model/User other {:email "rs-other@example.com"}]
+      (let [created (mt/user-http-request owner :post 200 "exploration"
+                                          {:name "private"
+                                           :collection_id (:id (collection/user->personal-collection (:id owner)))})
+            tid     (-> created :threads first :id)]
+        ;; Perms ride the thread's parent exploration, resolved by `write-check-thread`.
+        ;; Mark the thread terminal — restart refuses in-flight threads with a 409.
+        (t2/update! :model/ExplorationThread tid {:canceled_at (t/offset-date-time)})
+        (mt/user-http-request other :post 403 (format "exploration/thread/%d/restart" tid))
+        (let [resp (mt/user-http-request owner :post 200 (format "exploration/thread/%d/restart" tid))]
+          (is (= 1 (count (:threads resp))) "still a single thread after restart"))))))
+
+(deftest exploration-restart-targets-the-requested-thread-test
+  (testing "POST /thread/:thread-id/restart restarts the addressed thread, not the exploration's newest one —"
+    (testing "an exploration holds several threads once \"Explore further\" is used, each with its own Restart"
+      (mt/with-temp [:model/User u {:email "rs-multi@example.com"}]
+        (let [created  (mt/user-http-request u :post 200 "exploration" {:name "multi"})
+              expl-id  (:id created)
+              root-tid (-> created :threads first :id)
+              ;; A later thread, as "Explore further" creates: higher position, so it's the one the
+              ;; old "latest thread" rule would have picked.
+              drill    (first (t2/insert-returning-instances!
+                               :model/ExplorationThread
+                               {:exploration_id expl-id :name "drill" :position 1
+                                :canceled_at    (t/offset-date-time)}))]
+          (t2/update! :model/ExplorationThread root-tid {:canceled_at (t/offset-date-time)})
+          (mt/user-http-request u :post 200 (format "exploration/thread/%d/restart" root-tid))
+          (is (nil? (t2/select-one-fn :canceled_at :model/ExplorationThread :id root-tid))
+              "the named (root) thread was reset")
+          (is (some? (t2/select-one-fn :canceled_at :model/ExplorationThread :id (:id drill)))
+              "the newest thread was left alone"))))))
+
+(deftest exploration-restart-404s-on-unknown-thread-test
+  (testing "POST /thread/:thread-id/restart 404s for a thread that doesn't exist"
+    ;; The thread is the whole address, so a caller can't name a thread in one exploration while
+    ;; addressing another — the mismatch the exploration-scoped route had to guard against isn't
+    ;; expressible here. Perms ride the thread's parent exploration (see the permissions test).
+    (mt/with-temp [:model/User u {:email "rs-404@example.com"}]
+      (mt/user-http-request u :post 404 "exploration/thread/9999999/restart"))))
+
+(deftest restart-refuses-in-flight-thread-test
+  (testing "POST /thread/:thread-id/restart refuses non-terminal or mid-execution threads with a 409"
+    (mt/with-temp [:model/User u {:email "restart-guard@example.com"}
+                   :model/Card metric (valid-metric-card (:id u))]
+      (let [created (create-exploration! u {:name       "restart guard"
+                                            :metrics    [{:card_id (:id metric)
+                                                          :dimension_mappings [{:dimension_id "d1"
+                                                                                :table_id (mt/id :venues)
+                                                                                :target ["field" {} (mt/id :venues :price)]}]}]
+                                            :dimensions [{:dimension_id "d1" :display_name "Price"
+                                                          :effective_type "type/Number"}]})
+            tid     (-> created :threads first :id)
+            eq-id   (t2/select-one-fn :id :model/ExplorationQuery :exploration_thread_id tid)]
+        (testing "an in-flight (non-terminal) thread returns 409 and nothing is reset"
+          (mt/user-http-request u :post 409 (format "exploration/thread/%d/restart" tid))
+          (is (pos? (t2/count :model/ExplorationQuery :exploration_thread_id tid))
+              "its materialized queries are untouched"))
+        (testing "a canceled thread with a query still mid-QP-execution returns 409"
+          (t2/update! :model/ExplorationThread tid
+                      {:canceled_at (t/offset-date-time)})
+          (t2/update! :model/ExplorationQuery eq-id {:status "running" :started_at (t/offset-date-time)})
+          (mt/user-http-request u :post 409 (format "exploration/thread/%d/restart" tid))
+          (is (some? (t2/select-one-fn :canceled_at :model/ExplorationThread :id tid))
+              "the terminal stamp survives — nothing was reset"))
+        (testing "once no query is mid-execution, restart succeeds and leaves the thread claimable"
+          (t2/update! :model/ExplorationQuery eq-id {:status "canceled"})
+          (mt/user-http-request u :post 200 (format "exploration/thread/%d/restart" tid))
+          (let [thread (t2/select-one :model/ExplorationThread :id tid)]
+            ;; exactly the state the planning worker's claim-unplanned-thread! predicate claims:
+            ;; started_at set, every other lifecycle timestamp NULL, zero exploration_query rows.
+            (is (some? (:started_at thread)))
+            (is (nil? (:query_plan_started_at thread)))
+            (is (nil? (:canceled_at thread)))
+            (is (zero? (t2/count :model/ExplorationQuery :exploration_thread_id tid)))))))))
