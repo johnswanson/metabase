@@ -838,6 +838,7 @@
   override either timeout per request by passing `:connection-timeout` /
   `:socket-timeout` in `req`."
   [{:keys [url headers]} req]
+  (llm/assert-llm-host-allowed! url)
   (http/request (-> {:connection-timeout (llm/llm-connection-timeout-ms)
                      :socket-timeout     (llm/llm-request-timeout-ms)}
                     (merge req)

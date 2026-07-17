@@ -1211,6 +1211,7 @@
            metabase.llm.startup}
    :uses #{analytics
            api
+           config
            driver
            lib
            lib-be
