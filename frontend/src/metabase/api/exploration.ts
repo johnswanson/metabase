@@ -1,13 +1,19 @@
 import type {
+  CancelExplorationThreadRequest,
+  CancelExplorationThreadResponse,
   CreateExplorationRequest,
+  Dataset,
   Exploration,
   ExplorationId,
+  ExplorationQueryId,
   GetExplorationDataRequest,
   GetExplorationDataResponse,
   GetMyExplorationsRequest,
   GetMyExplorationsResponse,
+  RestartExplorationRequest,
   UpdateExplorationRequest,
 } from "metabase-types/api";
+import { getExplorationPages } from "metabase-types/api/exploration";
 
 import { Api } from "./api";
 import { idTag, invalidateTags, listTag, provideMetricListTags } from "./tags";
@@ -66,6 +72,17 @@ export const explorationApi = Api.injectEndpoints({
           listTag("exploration"),
         ]),
     }),
+    restartExploration: builder.mutation<
+      Exploration,
+      RestartExplorationRequest
+    >({
+      query: ({ threadId }) => ({
+        method: "POST",
+        url: `/api/exploration/thread/${threadId}/restart`,
+      }),
+      invalidatesTags: (_, error, { explorationId }) =>
+        invalidateTags(error, [idTag("exploration", explorationId)]),
+    }),
     deleteExploration: builder.mutation<void, ExplorationId>({
       query: (id) => ({
         method: "DELETE",
@@ -77,6 +94,62 @@ export const explorationApi = Api.injectEndpoints({
           listTag("exploration"),
         ]),
     }),
+    cancelExplorationThread: builder.mutation<
+      CancelExplorationThreadResponse,
+      CancelExplorationThreadRequest
+    >({
+      query: ({ threadId }) => ({
+        method: "POST",
+        url: `/api/exploration/thread/${threadId}/cancel`,
+      }),
+      invalidatesTags: (_, error, { explorationId }) =>
+        invalidateTags(error, [idTag("exploration", explorationId)]),
+    }),
+    getExplorationQueryResult: builder.query<Dataset, ExplorationQueryId>({
+      query: (id) => ({
+        method: "GET",
+        url: `/api/exploration/query/${id}`,
+      }),
+      // Hold each query's result in the cache for 30 minutes after the last
+      // subscriber unmounts so that flipping between previously-viewed queries
+      // inside one session is instant (no skeleton flash on re-select).
+      keepUnusedDataFor: 30 * 60,
+    }),
+    setPagesHidden: builder.mutation<
+      void,
+      { pageIds: number[]; explorationId: ExplorationId; hidden: boolean }
+    >({
+      query: ({ pageIds, hidden }) => ({
+        method: "PUT",
+        url: `/api/exploration/pages/hidden`,
+        body: { page_ids: pageIds, hidden },
+      }),
+      async onQueryStarted(
+        { pageIds, explorationId, hidden },
+        { dispatch, queryFulfilled },
+      ) {
+        const hiddenPageIds = new Set(pageIds);
+        const patchResult = dispatch(
+          explorationApi.util.updateQueryData(
+            "getExploration",
+            explorationId,
+            (draft) => {
+              // casting as Exploration prevents excessively deep type error
+              for (const page of getExplorationPages(draft as Exploration)) {
+                if (hiddenPageIds.has(page.id)) {
+                  page.hidden = hidden;
+                }
+              }
+            },
+          ),
+        );
+        try {
+          await queryFulfilled;
+        } catch {
+          patchResult.undo();
+        }
+      },
+    }),
   }),
 });
 
@@ -86,5 +159,9 @@ export const {
   useGetMyExplorationsQuery,
   useCreateExplorationMutation,
   useUpdateExplorationMutation,
+  useRestartExplorationMutation,
   useDeleteExplorationMutation,
+  useCancelExplorationThreadMutation,
+  useGetExplorationQueryResultQuery,
+  useSetPagesHiddenMutation,
 } = explorationApi;
