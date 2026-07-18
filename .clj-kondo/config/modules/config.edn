@@ -940,6 +940,7 @@
                     :model/DashboardTab
                     :model/Dimension
                     :model/Document
+                    :model/Exploration
                     :model/Measure
                     :model/NativeQuerySnippet
                     :model/PermissionsGroup
@@ -1016,7 +1017,9 @@
 
   explorations
   {:team "UX West"
-   :api  #{metabase.explorations.api metabase.explorations.core metabase.explorations.init}
+   :api  #{metabase.explorations.api
+           metabase.explorations.core
+           metabase.explorations.init}
    :uses #{analytics
            analytics-interface
            api
@@ -1502,7 +1505,8 @@
 
   mq
   {:team "UX West"
-   :api  #{metabase.mq.core metabase.mq.init}
+   :api  #{metabase.mq.core
+           metabase.mq.init}
    :uses #{analytics-interface
            app-db
            classloader
@@ -1810,7 +1814,7 @@
    :api  #{metabase.queries.core
            metabase.queries.init
            metabase.queries.models.card
-           metabase.queries.models.query
+           metabase.queries.models.query ; TODO FIXME
            metabase.queries.schema}
    :uses #{analytics
            analytics-interface
