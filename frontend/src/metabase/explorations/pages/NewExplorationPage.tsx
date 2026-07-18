@@ -19,6 +19,7 @@ export function NewExplorationPage() {
   const handleCreate = async () => {
     const exploration = await createExploration({
       name: t`New exploration`,
+      blocks: [],
     }).unwrap();
     dispatch(push(Urls.exploration(exploration.id)));
   };
