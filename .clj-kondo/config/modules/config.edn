@@ -301,6 +301,7 @@
                     :model/Database
                     :model/Dimension
                     :model/Document
+                    :model/Exploration
                     :model/Measure
                     :model/ModelIndexValue
                     :model/NativeQuerySnippet
@@ -1036,6 +1037,7 @@
            query-permissions
            query-processor
            request
+           search
            settings
            timeline
            types
