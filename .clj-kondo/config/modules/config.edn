@@ -1025,10 +1025,14 @@
            metrics
            models
            queries
+           query-processor
            request
            util}
    :model-exports #{:model/Exploration}
-   :model-imports #{:model/Card :model/Collection :model/User}}
+   :model-imports #{:model/Card
+                    :model/Collection
+                    :model/Segment
+                    :model/User}}
 
   formatter
   {:team "UX West"
