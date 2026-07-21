@@ -229,15 +229,18 @@
 (deftest exploration-create-persists-blocks-verbatim-test
   (testing "POST / persists each :blocks entry as its own ExplorationBlock row — no dedup across blocks"
     (mt/with-temp [:model/User u {:email "groups@example.com"}
-                   :model/Card metric (valid-metric-card (:id u))]
+                   :model/Card metric (valid-metric-card (:id u))
+                   :model/Timeline tl {:creator_id (:id u)}]
       (let [mapping [{:dimension_id "d1"
                       :table_id (mt/id :venues)
                       :target ["field" {} (mt/id :venues :price)]}]
             ;; Two blocks sharing the same metric: a metric block (metric + d1) and a
-            ;; dimension block (the same metric, with d2). Each block is stored verbatim —
-            ;; the shared metric is NOT deduped across blocks.
+            ;; dimension block (the same metric, with d2). Timelines are thread-scoped,
+            ;; sent once at the top level. Each block is stored verbatim — the shared
+            ;; metric is NOT deduped across blocks.
             body {:name         "Blocked create"
                   :prompt       "via blocks"
+                  :timeline_ids [(:id tl)]
                   :blocks       [{:type       "metric"
                                   :metrics    [{:card_id (:id metric) :dimension_mappings mapping}]
                                   :dimensions [{:dimension_id "d1" :display_name "Price"
@@ -256,7 +259,29 @@
         (is (= [0 1] (map :position blocks)))
         (testing "each block keeps its own metrics + dimensions selection"
           (is (= [(:id metric) (:id metric)] (map #(-> % :metrics first :card_id) blocks)))
-          (is (= ["d1" "d2"] (map #(-> % :dimensions first :dimension_id) blocks))))))))
+          (is (= ["d1" "d2"] (map #(-> % :dimensions first :dimension_id) blocks))))
+        (testing "timelines are thread-scoped, stored once"
+          (is (= 1 (t2/count :model/ExplorationThreadTimeline :exploration_thread_id tid))))))))
+
+(deftest exploration-get-hydrates-thread-timelines-test
+  (testing "GET /api/exploration/:id hydrates thread :timelines so the detail page can offer them"
+    (mt/with-temp [:model/User u {:email "tl-hydrate@example.com"}
+                   :model/Card metric (valid-metric-card (:id u))
+                   :model/Timeline tl {:creator_id (:id u) :name "Releases"}]
+      (let [body      {:name         "Timeline hydrate"
+                       :metrics      [{:card_id (:id metric)
+                                       :dimension_mappings [{:dimension_id "d1"
+                                                             :table_id (mt/id :venues)
+                                                             :target ["field" {} (mt/id :venues :price)]}]}]
+                       :dimensions   [{:dimension_id "d1" :display_name "Price"
+                                       :effective_type "type/Number"}]
+                       :timeline_ids [(:id tl)]}
+            resp      (create-exploration! u body)
+            timelines (-> resp :threads first :timelines)]
+        (is (= 1 (count timelines)))
+        (is (= (:id tl) (-> timelines first :timeline_id)))
+        (is (= "Releases" (-> timelines first :timeline :name))
+            "nested :timeline is hydrated for the picker")))))
 
 (deftest create-checks-block-card-permissions-test
   (testing "POST / read-checks every metric card referenced by the blocks payload"
@@ -691,7 +716,8 @@
 (deftest exploration-restart-reruns-existing-thread-test
   (testing "POST /thread/:thread-id/restart re-runs that thread in place, keeping selections"
     (mt/with-temp [:model/User u {:email "restart@example.com"}
-                   :model/Card metric (valid-metric-card (:id u))]
+                   :model/Card metric (valid-metric-card (:id u))
+                   :model/Timeline tl {:creator_id (:id u)}]
       (let [body      {:name         "Why is revenue down"
                        :prompt       "break down by region"
                        :metrics      [{:card_id (:id metric)
@@ -699,7 +725,8 @@
                                                              :table_id (mt/id :venues)
                                                              :target ["field" {} (mt/id :venues :price)]}]}]
                        :dimensions   [{:dimension_id "d1" :display_name "Price"
-                                       :effective_type "type/Number"}]}
+                                       :effective_type "type/Number"}]
+                       :timeline_ids [(:id tl)]}
             created   (create-exploration! u body)
             expl-id   (:id created)
             thread    (-> created :threads first)
@@ -726,7 +753,8 @@
               (is (= 1 (count blocks)) "the Research-plan block survives the restart")
               (is (= 1 (count (:metrics (first blocks)))) "its metric selection is preserved")
               (is (= ["d1"] (mapv :dimension_id (:dimensions (first blocks))))
-                  "its dimension selection is preserved")))
+                  "its dimension selection is preserved"))
+            (is (= 1 (count (:timelines rerun)))))
           (testing "the planner regenerates queries for the same thread"
             (query-plan/generate-query-plan! orig-tid)
             (let [hydrated (mt/user-http-request u :get 200 (format "exploration/%d" expl-id))
@@ -776,6 +804,35 @@
     ;; expressible here. Perms ride the thread's parent exploration (see the permissions test).
     (mt/with-temp [:model/User u {:email "rs-404@example.com"}]
       (mt/user-http-request u :post 404 "exploration/thread/9999999/restart"))))
+
+(deftest create-checks-timeline-permissions-test
+  (testing "POST / read-checks every attached timeline id"
+    (mt/with-temp [:model/User u {:email "tl-perms@example.com"}
+                   :model/Collection hidden {:name "hidden-timelines"}
+                   :model/Timeline secret-tl {:creator_id    (mt/user->id :crowberto)
+                                              :collection_id (:id hidden)}]
+      (perms/revoke-collection-permissions! (perms-group/all-users) (:id hidden))
+      (let [base {:name          "tl perm check"
+                  :collection_id (:id (collection/user->personal-collection (:id u)))}]
+        (testing "an unreadable timeline id is a 403"
+          (mt/user-http-request u :post 403 "exploration"
+                                (assoc base :timeline_ids [(:id secret-tl)])))
+        (testing "a nonexistent timeline id is a 404"
+          (mt/user-http-request u :post 404 "exploration"
+                                (assoc base :timeline_ids [Integer/MAX_VALUE])))
+        (testing "nothing was persisted by the rejected requests"
+          (is (zero? (t2/count :model/Exploration :name "tl perm check"))))))))
+
+(deftest create-dedupes-timeline-ids-test
+  (testing "POST / dedupes repeated timeline_ids instead of 500ing on the unique constraint"
+    (mt/with-temp [:model/User u {:email "tl-dupes@example.com"}
+                   :model/Timeline tl {:creator_id (:id u)}]
+      (let [resp (mt/user-http-request u :post 200 "exploration"
+                                       {:name         "tl dupes"
+                                        :timeline_ids [(:id tl) (:id tl)]})
+            tid  (-> resp :threads first :id)]
+        (is (= 1 (t2/count :model/ExplorationThreadTimeline :exploration_thread_id tid))
+            "the duplicate id collapses to a single attachment")))))
 
 (deftest restart-refuses-in-flight-thread-test
   (testing "POST /thread/:thread-id/restart refuses non-terminal or mid-execution threads with a 409"

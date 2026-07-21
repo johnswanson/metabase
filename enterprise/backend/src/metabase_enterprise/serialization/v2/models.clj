@@ -92,6 +92,7 @@
    "ExplorationQuery"
    "ExplorationQueryResult"
    "ExplorationThread"
+   "ExplorationThreadTimeline"
    "HTTPAction"
    "ImplicitAction"
    "LoginHistory"

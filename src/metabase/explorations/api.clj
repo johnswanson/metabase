@@ -45,7 +45,7 @@
         (api/write-check collection/root-collection)))))
 
 (defn- hydrate-exploration [exploration]
-  (t2/hydrate exploration :creator :can_write :collection :threads))
+  (t2/hydrate exploration :creator :can_write :collection [:threads :timelines]))
 
 (defn- positional-rows
   "Stamp `:exploration_thread_id` and a 0-based `:position` onto each row in `rows`."
@@ -64,6 +64,16 @@
     (t2/insert! :model/ExplorationBlock
                 (positional-rows thread-id
                                  (map #(select-keys % [:type :metrics :dimensions]) blocks)))))
+
+(defn- insert-thread-timelines!
+  "Attach `timeline-ids` to the thread, in payload order. Deduped (`distinct`, keeping first
+   occurrence) — a repeated id would otherwise violate the table's unique
+   `(exploration_thread_id, timeline_id)` constraint and 500 the create."
+  [thread-id timeline-ids]
+  (when (seq timeline-ids)
+    (t2/insert! :model/ExplorationThreadTimeline
+                (positional-rows thread-id
+                                 (map (fn [tl-id] {:timeline_id tl-id}) (distinct timeline-ids))))))
 
 (defn- reset-thread-for-rerun!
   "CAS-reset a *terminal* thread (`canceled_at` set) back to the freshly-started state a new plan
@@ -108,7 +118,13 @@
    [:exploration_id ms/PositiveInt]
    [:prompt         {:optional true} [:maybe :string]]
    [:position       ms/IntGreaterThanOrEqualToZero]
-   [:started_at     {:optional true} [:maybe :any]]])
+   [:started_at     {:optional true} [:maybe :any]]
+   [:timelines      {:optional true}
+    [:maybe [:sequential
+             [:map
+              [:timeline_id ms/PositiveInt]
+              [:position    {:optional true} ms/IntGreaterThanOrEqualToZero]
+              [:timeline    {:optional true} [:maybe :map]]]]]]])
 
 (mr/def ::HydratedExploration
   "Schema for an Exploration with hydrated creator and threads."
@@ -235,13 +251,15 @@
   "Body schema for `POST /api/exploration`.
 
    The FE sends one entry per Research-plan block (`:blocks` — each a metric/dimension
-   area), each persisted verbatim."
+   area), each persisted verbatim. `:timeline_ids` is thread-scoped (timelines aren't part of
+   any metric×dimension cross-product) and lives at the top level, not inside a block."
   [:map
    [:name          expl.model/ExplorationName]
    [:description   {:optional true} [:maybe :string]]
    [:prompt        {:optional true} [:maybe :string]]
    [:collection_id {:optional true} [:maybe ms/PositiveInt]]
-   [:blocks        {:optional true} [:maybe [:sequential BlockSelection]]]])
+   [:blocks        {:optional true} [:maybe [:sequential BlockSelection]]]
+   [:timeline_ids  {:optional true} [:maybe [:sequential ms/PositiveInt]]]])
 
 (def ^:private UpdateExploration
   "Body schema for `PUT /api/exploration/:id`. All fields are optional; only the keys the client
@@ -291,20 +309,23 @@
 ;;; ----------------------------------------- endpoints -----------------------------------------
 
 (api.macros/defendpoint :post "/" :- ::HydratedExploration
-  "Create a new exploration with a single thread, persist the user's selected metrics and
-  dimensions, and stamp the thread as started. Actual planning is async; this endpoint returns
+  "Create a new exploration with a single thread, persist the user's selected metrics, dimensions,
+  and timelines, and stamp the thread as started. Actual planning is async; this endpoint returns
   immediately with an empty queries list. Clients should poll `GET /:id/queries` until rows appear.
 
-  Accepts the per-area `:blocks` payload (one entry per Research-plan block), persisted verbatim."
+  Accepts the per-area `:blocks` payload (one entry per Research-plan block), persisted
+  verbatim, plus a thread-scoped `:timeline_ids`."
   [_route-params
    _query-params
-   {:keys [name description prompt collection_id blocks]} :- CreateExploration]
+   {:keys [name description prompt collection_id blocks timeline_ids]} :- CreateExploration]
   (api/create-check :model/Exploration {:collection_id collection_id})
-  ;; Block metric-card references are persisted verbatim and read back unfiltered
+  ;; Block metric-card and timeline references are persisted verbatim and read back unfiltered
   ;; (planning context, thread hydration), so attach time is the
   ;; permission boundary: every referenced id must exist (404) and be readable (403) by the creator.
   (doseq [card-id (distinct (mapcat #(map :card_id (:metrics %)) blocks))]
     (api/read-check :model/Card card-id))
+  (doseq [timeline-id (distinct timeline_ids)]
+    (api/read-check :model/Timeline timeline-id))
   (let [persisted
         (t2/with-transaction [_]
           (let [exploration (first (t2/insert-returning-instances! :model/Exploration
@@ -315,7 +336,7 @@
                 ;; `started_at` marks the thread as started (past the draft phase). Planning itself
                 ;; is kicked off by the `start-thread!` enqueue below — its plan message rides a
                 ;; `:transactional :require` queue, so it publishes only once this whole transaction,
-                ;; including the dependent block rows below, commits atomically.
+                ;; including the dependent block/timeline rows below, commits atomically.
                 ;; The plan listener therefore can never observe (or plan) a half-built thread.
                 thread      (first (t2/insert-returning-instances! :model/ExplorationThread
                                                                    {:exploration_id (:id exploration)
@@ -324,6 +345,7 @@
                                                                     :started_at     (t/offset-date-time)}))
                 tid         (:id thread)]
             (insert-blocks! tid blocks)
+            (insert-thread-timelines! tid timeline_ids)
             (explorations.queues/start-thread! tid)
             (t2/select-one :model/Exploration :id (:id exploration))))]
     ;; Published after the transaction commits (matching PUT) so listeners can never observe an
