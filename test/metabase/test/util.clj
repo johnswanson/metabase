@@ -202,6 +202,12 @@
             {:creator_id (rasta-id)
              :name (u.random/random-name)}))
 
+   :model/ExplorationQuery
+   (fn [_] (default-timestamped
+            {:database_id (data/id)
+             :query_type "default"
+             :status "pending"}))
+
    :model/Field
    (fn [_] (default-timestamped
             {:database_type "VARCHAR"

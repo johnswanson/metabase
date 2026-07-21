@@ -89,6 +89,7 @@
    "Exploration"
    "ExplorationBlock"
    "ExplorationPage"
+   "ExplorationQuery"
    "ExplorationThread"
    "HTTPAction"
    "ImplicitAction"

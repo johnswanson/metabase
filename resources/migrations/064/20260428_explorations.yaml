@@ -237,6 +237,237 @@ databaseChangeLog:
 
 
   - changeSet:
+      id: v64.iowdfzx
+      author: nvoxland
+      comment: Create exploration_query table
+      changes:
+        - createTable:
+            tableName: exploration_query
+            remarks: A chart definition produced when "Start exploration" is run on a thread.
+            columns:
+              - column:
+                  name: id
+                  type: int
+                  autoIncrement: true
+                  remarks: Primary key
+                  constraints:
+                    primaryKey: true
+                    nullable: false
+              - column:
+                  name: exploration_thread_id
+                  type: int
+                  remarks: The thread this query belongs to
+                  constraints:
+                    nullable: false
+              - column:
+                  name: page_id
+                  type: int
+                  remarks: The exploration_page this query is reconciled under. The reconciler stamps it on every query, so it's required from the start.
+                  constraints:
+                    nullable: false
+              - column:
+                  name: name
+                  type: ${text.type}
+                  remarks: Optional display name for the chart
+                  constraints:
+                    nullable: true
+              - column:
+                  name: card_id
+                  type: int
+                  remarks: The metric Card this chart is for
+                  constraints:
+                    nullable: false
+              - column:
+                  name: database_id
+                  type: int
+                  remarks: Database the snapshot MBQL runs against, frozen alongside `dataset_query` at plan time. Lets the worker build the metadata provider and the data-permission gate read the database without parsing `dataset_query` or joining to the Card.
+                  constraints:
+                    nullable: false
+              - column:
+                  name: segment_id
+                  type: int
+                  remarks: Optional segment applied as a filter on top of (card, dimension); null for the unsegmented base query
+                  constraints:
+                    nullable: true
+              - column:
+                  name: dimension_id
+                  type: ${text.type}
+                  remarks: Virtual dimension ID used as the breakout for this chart
+                  constraints:
+                    nullable: false
+              - column:
+                  name: query_type
+                  type: varchar(32)
+                  defaultValue: default
+                  remarks: Generator variant — one of default, temporal-pattern-day, temporal-pattern-hour, time-facet, top-n-other, per-value-time-series, filtered-subset
+                  constraints:
+                    nullable: false
+              - column:
+                  name: display
+                  type: varchar(64)
+                  remarks: Chart display type (line, bar, etc.)
+                  constraints:
+                    nullable: true
+              - column:
+                  name: visualization_settings
+                  type: ${text.type}
+                  remarks: JSON visualization settings for this chart
+                  constraints:
+                    nullable: true
+              - column:
+                  name: dataset_query
+                  type: ${text.type}
+                  remarks: Snapshot MBQL produced at "Start" time; null until the runner lazily builds it at execution time
+                  constraints:
+                    nullable: true
+              - column:
+                  name: params
+                  type: ${text.type}
+                  remarks: JSON-encoded variant params consumed by the runner when finalizing the chart MBQL just before execution. Shape depends on variant — top-n-other carries a k; filtered-subset carries filter_values; per-value-time-series carries k plus value_index plus optional temporal_dimension_id.
+                  constraints:
+                    nullable: true
+              - column:
+                  name: position
+                  type: int
+                  defaultValueNumeric: 0
+                  remarks: Ordering of queries within a thread
+                  constraints:
+                    nullable: false
+              - column:
+                  name: status
+                  type: varchar(32)
+                  defaultValue: pending
+                  remarks: Worker state machine; one of pending, running, done, error
+                  constraints:
+                    nullable: false
+              - column:
+                  name: error_message
+                  type: ${text.type}
+                  remarks: Error message captured when the worker fails to execute the query
+                  constraints:
+                    nullable: true
+              - column:
+                  name: started_at
+                  type: ${timestamp_type}
+                  remarks: When the worker started executing this query
+                  constraints:
+                    nullable: true
+              - column:
+                  name: finished_at
+                  type: ${timestamp_type}
+                  remarks: When the worker finished executing this query (success or error)
+                  constraints:
+                    nullable: true
+              - column:
+                  name: entity_id
+                  type: char(21)
+                  remarks: NanoID for serdes; nullable so serdes drop-entity-ids! can NULL it
+                  constraints:
+                    nullable: true
+                    unique: true
+              - column:
+                  name: created_at
+                  type: ${timestamp_type}
+                  defaultValueComputed: current_timestamp
+                  remarks: When the query was created
+                  constraints:
+                    nullable: false
+              - column:
+                  name: updated_at
+                  type: ${timestamp_type}
+                  defaultValueComputed: current_timestamp
+                  remarks: When the query was last updated
+                  constraints:
+                    nullable: false
+
+  - changeSet:
+      id: v64.badwes
+      author: nvoxland
+      comment: Index on exploration_query.exploration_thread_id
+      changes:
+        - createIndex:
+            tableName: exploration_query
+            indexName: idx_exploration_query_thread_id
+            columns:
+              - column:
+                  name: exploration_thread_id
+
+  - changeSet:
+      id: v64.bwbaxcz
+      author: nvoxland
+      comment: FK exploration_query.exploration_thread_id -> exploration_thread.id
+      changes:
+        - addForeignKeyConstraint:
+            baseTableName: exploration_query
+            baseColumnNames: exploration_thread_id
+            referencedTableName: exploration_thread
+            referencedColumnNames: id
+            constraintName: fk_exploration_query_thread_id
+            onDelete: CASCADE
+
+  - changeSet:
+      id: v64.expquerycardidx
+      author: nvoxland
+      comment: Index on exploration_query.card_id
+      changes:
+        - createIndex:
+            tableName: exploration_query
+            indexName: idx_exploration_query_card_id
+            columns:
+              - column:
+                  name: card_id
+
+  - changeSet:
+      id: v64.28easd
+      author: nvoxland
+      comment: FK exploration_query.card_id -> report_card.id
+      changes:
+        - addForeignKeyConstraint:
+            baseTableName: exploration_query
+            baseColumnNames: card_id
+            referencedTableName: report_card
+            referencedColumnNames: id
+            constraintName: fk_exploration_query_card_id
+            onDelete: CASCADE
+
+  - changeSet:
+      id: v64.expquerysegidx
+      author: nvoxland
+      comment: Index on exploration_query.segment_id
+      changes:
+        - createIndex:
+            tableName: exploration_query
+            indexName: idx_exploration_query_segment_id
+            columns:
+              - column:
+                  name: segment_id
+
+  - changeSet:
+      id: v64.qsegfk
+      author: johnswanson
+      comment: FK exploration_query.segment_id -> segment.id
+      changes:
+        - addForeignKeyConstraint:
+            baseTableName: exploration_query
+            baseColumnNames: segment_id
+            referencedTableName: segment
+            referencedColumnNames: id
+            constraintName: fk_exploration_query_segment_id
+            onDelete: CASCADE
+
+  - changeSet:
+      id: v64.qstatusidx
+      author: nvoxland
+      comment: Index on exploration_query.status for the worker poll
+      changes:
+        - createIndex:
+            tableName: exploration_query
+            indexName: idx_exploration_query_status
+            columns:
+              - column:
+                  name: status
+
+  - changeSet:
       id: v64.expeidnull
       author: nvoxland
       comment: Make exploration.entity_id nullable so serdes drop-entity-ids! can NULL it
@@ -477,4 +708,29 @@ databaseChangeLog:
             referencedTableName: report_card
             referencedColumnNames: id
             constraintName: fk_exploration_page_card_id
+            onDelete: CASCADE
+
+  - changeSet:
+      id: v64.expqpageidx
+      author: johnswanson
+      comment: Index exploration_query.page_id for read-side grouping
+      changes:
+        - createIndex:
+            tableName: exploration_query
+            indexName: idx_exploration_query_page_id
+            columns:
+              - column:
+                  name: page_id
+
+  - changeSet:
+      id: v64.expqpagefk
+      author: johnswanson
+      comment: FK exploration_query.page_id -> exploration_page.id
+      changes:
+        - addForeignKeyConstraint:
+            baseTableName: exploration_query
+            baseColumnNames: page_id
+            referencedTableName: exploration_page
+            referencedColumnNames: id
+            constraintName: fk_exploration_query_page_id
             onDelete: CASCADE
