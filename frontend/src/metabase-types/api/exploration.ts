@@ -3,14 +3,14 @@ import type { MetricDimension } from "./measure";
 import type { PaginationRequest, PaginationResponse } from "./pagination";
 import type { UserId } from "./user";
 
-export type ExplorationId = number;
-export type ExplorationThreadId = number;
-
 export type ExplorationDimensionGroup = {
   name: string;
   dimension_interestingness: number | null;
   dimensions: MetricDimension[];
 };
+
+export type ExplorationId = number;
+export type ExplorationThreadId = number;
 
 export interface CreateExplorationRequest {
   name: string;
