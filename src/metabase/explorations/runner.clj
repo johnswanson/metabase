@@ -7,9 +7,11 @@
 
   Each is idempotent for calling from MQ."
   (:require
+   [clojure.string :as str]
    [medley.core :as m]
    [metabase.analytics-interface.core :as analytics.interface]
    [metabase.analytics.core :as analytics]
+   [metabase.contextual-interestingness.core :as contextual-interestingness]
    [metabase.explorations.interestingness :as explorations.interestingness]
    [metabase.explorations.query-plan :as explorations.query-plan]
    [metabase.explorations.query-plan.context :as qp.context]
@@ -173,6 +175,105 @@
   (t2/select-one-fn :exploration_id :model/ExplorationThread
                     :id (:exploration_thread_id exploration-query)))
 
+(defn- variant-note
+  "Human phrase for a chart's breakdown variant + params, or nil for the plain `default`
+  (which adds no breakdown beyond the bare metric × dimension)."
+  [query-type params]
+  (case query-type
+    "temporal-pattern-day"  "aggregated by day-of-week"
+    "temporal-pattern-hour" "aggregated by hour-of-day"
+    "time-facet"            "one line per dimension value, over time"
+    "top-n-other"           (str "top " (:k params) " values, remainder grouped as Other")
+    "filtered-subset"       (let [vs (:filter_values params)]
+                              (str "restricted to "
+                                   (if (and (sequential? vs) (= 1 (count vs)))
+                                     (str (first vs))
+                                     (str (count vs) " selected values"))))
+    "per-value-time-series" "a single dimension value, tracked over time"
+    nil))
+
+(defn- slicing-note
+  "Compact, explicit description of how a chart is sliced — its breakdown variant and/or
+  segment filter — handed to the contextual scorer/describer so fan-out siblings of one
+  metric × dimension get distinct, accurate descriptions instead of collapsing together.
+  Returns nil for a plain unsegmented default breakdown (nothing to call out)."
+  [row]
+  (let [segment-name (when-let [sid (:segment_id row)]
+                       (t2/select-one-fn :name :model/Segment :id sid))
+        variant      (variant-note (:query_type row) (:params row))
+        parts        (cond-> []
+                       variant      (conj variant)
+                       segment-name (conj (str "filtered to segment \"" segment-name "\"")))]
+    (when (seq parts)
+      (str/join "; " parts))))
+
+(defn- build-score-context
+  "Resolve the *expensive* inputs the contextual scorer needs from `exploration-query`: the
+  (trimmed, non-blank) source Card description and the compiled SQL of the dataset_query.
+  Called only after the cheap gates in [[safe-score+describe]] (chart-config present, creator
+  known, non-blank thread prompt) have passed, so the Card select and SQL compile never run for
+  charts that won't be scored."
+  [exploration-query]
+  {:card-description (when-let [card-id (:card_id exploration-query)]
+                       (some-> (t2/select-one-fn :description :model/Card :id card-id)
+                               str/trim
+                               not-empty))
+   :sql              (contextual-interestingness/dataset-query->sql (:dataset_query exploration-query))})
+
+(defn- safe-score+describe
+  "Best-effort combined contextual scorer + describer for one chart. Threads the source
+  Card's description (when present), the compiled SQL of the dataset_query, and the thread
+  prompt into a single LLM call that returns
+
+      {:score :chart-description :metric-description}
+
+  `:metric-description` is always the *effective* description — Card-authored when the Card
+  has one (the LLM is told not to regenerate it; we substitute the authored text), otherwise
+  the LLM-generated one. Downstream consumers can read this directly without caring about
+  the source.
+
+  Runs inside a `request/with-current-user creator-id` binding so the LLM call
+  (`metabase.metabot.self/call-llm-structured-with-trace`, reached via
+  `score-and-describe-chart`) sees the right user context and gets billed/limited
+  per-creator. The permission gate (`:permission/metabot-other-tools`) and the
+  AI usage-limit check sit in `score-and-describe-chart`'s own pre-flight `cond`
+  (via `metabot/llm-call-available?`); a closed gate makes it return nil rather
+  than throw, leaving the EQR row's contextual fields nil — same fail-soft
+  contract as `safe-score`.
+
+  Returns nil whenever scoring isn't applicable (no prompt, no chart-config, no
+  creator) or anything throws — so a scoring failure can never break the query
+  lifecycle. The cheap gates run before [[build-score-context]]'s DB reads and
+  SQL compile, so non-applicable charts cost nothing here."
+  [exploration-query chart-config creator-id]
+  (try
+    (when-let [thread-id (and chart-config (:exploration_thread_id exploration-query))]
+      (if (nil? creator-id)
+        (log/warnf "Skipping contextual interestingness for ExplorationQuery %d: no creator-id on exploration"
+                   (:id exploration-query))
+        (let [prompt (t2/select-one-fn :prompt :model/ExplorationThread :id thread-id)]
+          (when-not (str/blank? prompt)
+            (let [{:keys [card-description sql]} (build-score-context exploration-query)]
+              (request/with-current-user creator-id
+                (when-let [result (some-> (contextual-interestingness/score-and-describe-chart
+                                           {:chart-config     chart-config
+                                            :card-description card-description
+                                            :chart-slicing    (slicing-note exploration-query)
+                                            :sql              sql
+                                            :context-string   prompt})
+                                          (update :metric-description #(or card-description %)))]
+                  (log/debugf "Contextual interestingness for ExplorationQuery %d (thread %d): score=%s reasoning=%s chart-description=%s"
+                              (:id exploration-query)
+                              (:exploration_thread_id exploration-query)
+                              (:score result)
+                              (pr-str (:reasoning result))
+                              (pr-str (:chart-description result)))
+                  result)))))))
+    (catch Throwable e
+      (log/warnf e "Failed to compute contextual interestingness for ExplorationQuery %d"
+                 (:id exploration-query))
+      nil)))
+
 (defn- compute-data-access-token
   "The creator's effective-data-access token for `dataset-query` — the sandbox/impersonation/routing
   fingerprint the snapshot is computed under, stored on the `StoredResult` and compared against a
@@ -189,7 +290,8 @@
 
 (defn- compute-query-result
   "The slow half of running `row`: the warehouse query, its serialization, and the chart-config /
-  stats / score. Returns everything [[persist-query-result!]] needs to write.
+  stats / scores (`safe-score+describe` makes an LLM call). Returns everything
+  [[persist-query-result!]] needs to write.
 
   Deliberately holds no transaction.
 
@@ -220,13 +322,14 @@
      :row-count  (:row_count qp-result)
      :token      token
      :stats      stats
-     :score      (safe-score row chart-config stats)}))
+     :score      (safe-score row chart-config stats)
+     :ctx        (safe-score+describe row chart-config creator-id)}))
 
 (defn- persist-query-result!
   "Write what [[compute-query-result]] produced and flip the query to `done` transactionally.
 
   Returns false when a peer delivery already persisted this query."
-  [row ^OffsetDateTime started {:keys [creator-id db-id bytes row-count token stats score]}]
+  [row ^OffsetDateTime started {:keys [creator-id db-id bytes row-count token stats score ctx]}]
   (try
     (t2/with-transaction [_conn]
       (let [sr-id (first
@@ -239,10 +342,13 @@
                      :row_count         row-count
                      :data_access_token token}))]
         (t2/insert! :model/ExplorationQueryResult
-                    {:exploration_query_id  (:id row)
-                     :stored_result_id      sr-id
-                     :chart_stats           stats
-                     :interestingness_score score})
+                    {:exploration_query_id             (:id row)
+                     :stored_result_id                 sr-id
+                     :chart_stats                      stats
+                     :interestingness_score            score
+                     :contextual_interestingness_score (:score ctx)
+                     :metric_description               (:metric-description ctx)
+                     :chart_description                (:chart-description ctx)})
         ;; Record the (exploration -> stored_result) reference for lifecycle/GC tracking.
         (t2/insert! :model/StoredResultUse
                     {:stored_result_id sr-id

@@ -698,7 +698,7 @@
 
   contextual-interestingness
   {:team "UX West"
-   :api  #{}
+   :api  #{metabase.contextual-interestingness.core}
    :uses #{interestingness
            metabot
            query-processor
@@ -1021,6 +1021,7 @@
            api
            app-db
            collections
+           contextual-interestingness
            events
            interestingness
            lib
