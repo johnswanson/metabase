@@ -493,6 +493,9 @@
                      {:description "Number of exploration_query rows currently in 'pending' status (awaiting execution by the explorations background runner)."})
    (prometheus/gauge :metabase-explorations/oldest-pending-age-seconds
                      {:description "Age in seconds of the oldest still-pending exploration_query (0 when the queue is empty)."})
+   (prometheus/counter :metabase-explorations/queries-processed
+                       {:description "Exploration queries processed."
+                        :labels [:status]})
    ;; notification metrics
    (prometheus/counter :metabase-notification/send-ok
                        {:description "Number of successful notification sends."

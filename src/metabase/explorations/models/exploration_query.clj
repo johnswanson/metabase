@@ -1,6 +1,7 @@
 (ns metabase.explorations.models.exploration-query
   (:require
    [metabase.models.interface :as mi]
+   [metabase.util :as u]
    [methodical.core :as methodical]
    [toucan2.core :as t2]))
 
@@ -29,6 +30,36 @@
   ([_model pk]
    (when-let [q (t2/select-one [:model/ExplorationQuery :exploration_thread_id] :id pk)]
      (mi/can-write? :model/ExplorationThread (:exploration_thread_id q)))))
+
+(defn- hydrate-score-from-result [score-key queries]
+  (mi/instances-with-hydrated-data
+   queries score-key
+   #(u/index-by :exploration_query_id score-key
+                (t2/select [:model/ExplorationQueryResult :exploration_query_id score-key]
+                           :exploration_query_id [:in (map :id queries)]))
+   :id))
+
+(methodical/defmethod t2/batched-hydrate [:model/ExplorationQuery :interestingness_score]
+  [_model k queries]
+  (hydrate-score-from-result k queries))
+
+(methodical/defmethod t2/batched-hydrate [:model/ExplorationQuery :contextual_interestingness_score]
+  [_model k queries]
+  (hydrate-score-from-result k queries))
+
+(methodical/defmethod t2/batched-hydrate [:model/ExplorationQuery :row_count]
+  [_model k queries]
+  (mi/instances-with-hydrated-data
+   queries k
+   #(u/index-by :exploration_query_id :row_count
+                (t2/select [:model/ExplorationQueryResult
+                            :exploration_query_result.exploration_query_id
+                            [:stored_result.row_count :row_count]]
+                           {:join  [:stored_result
+                                    [:= :stored_result.id :exploration_query_result.stored_result_id]]
+                            :where [:in :exploration_query_result.exploration_query_id
+                                    (map :id queries)]}))
+   :id))
 
 (methodical/defmethod t2/batched-hydrate [:model/ExplorationQuery :segment_name]
   [_model k queries]
