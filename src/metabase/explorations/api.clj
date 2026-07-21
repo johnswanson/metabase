@@ -76,17 +76,18 @@
                                  (map (fn [tl-id] {:timeline_id tl-id}) (distinct timeline-ids))))))
 
 (defn- reset-thread-for-rerun!
-  "CAS-reset a *terminal* thread (`canceled_at` set) back to the freshly-started state a new plan
-  run expects: `started_at` set, every other lifecycle timestamp NULL, and zero `exploration_query`
-  rows. On success it enqueues a fresh planning message (`explorations.queues/start-thread!`) inside
-  the same transaction, so planning re-runs iff the reset committed. Returns true when the reset
-  applied; false when the guarded UPDATE matched no row.
+  "CAS-reset a *terminal* thread (`completed_at` set — natural completion, terminal failure, or
+  cancel) back to the freshly-started state a new plan run expects: `started_at` set, every other
+  lifecycle timestamp NULL, and zero `exploration_query` rows. On success it enqueues a fresh
+  planning message (`explorations.queues/start-thread!`) inside the same transaction, so planning
+  re-runs iff the reset committed. Returns true when the reset applied; false when the guarded
+  UPDATE matched no row.
 
-  The guard refuses while the thread is still in flight: not yet terminal, or a query worker still
-  holds a `running` row (possible on a canceled thread, whose in-flight queries run to natural
-  completion). A restart racing in-flight work could otherwise strand query rows a still-running
-  planner inserts after the reset, or let an in-flight query worker's completion CAS stamp the
-  freshly-reset thread."
+  The guard refuses while the thread is still in flight: not yet terminal, or a query worker
+  still holds a `running` row (possible on a canceled thread, whose in-flight queries run to
+  natural completion). A restart racing in-flight work could otherwise strand query rows a
+  still-running planner inserts after the reset, or let an in-flight query worker's completion
+  CAS stamp the freshly-reset thread."
   [thread-id]
   (t2/with-transaction [_conn]
     (when (pos? (t2/query-one
@@ -94,10 +95,12 @@
                   :set    {:started_at            (t/offset-date-time)
                            :query_plan_started_at nil
                            :query_plan_transcript nil
+                           :analysis_started_at   nil
+                           :completed_at          nil
                            :canceled_at           nil}
                   :where  [:and
                            [:= :id thread-id]
-                           [:not= :canceled_at nil]
+                           [:not= :completed_at nil]
                            [:not-exists {:select [1]
                                          :from   [:exploration_query]
                                          :where  [:and
@@ -119,6 +122,8 @@
    [:prompt         {:optional true} [:maybe :string]]
    [:position       ms/IntGreaterThanOrEqualToZero]
    [:started_at     {:optional true} [:maybe :any]]
+   [:canceled_at    {:optional true} [:maybe :any]]
+   [:completed_at   {:optional true} [:maybe :any]]
    [:timelines      {:optional true}
     [:maybe [:sequential
              [:map
@@ -491,8 +496,9 @@
 (api.macros/defendpoint :post "/thread/:thread-id/restart" :- ::HydratedExploration
   "Re-run one exploration thread in place, keeping its selections: drops the thread's materialized
   queries and clears the terminal-state gates so the background planner re-claims it. Returns the
-  parent exploration. Only a terminal (canceled) thread can restart; while planning or execution is
-  still in flight this returns a 409 — cancel the thread first, then restart.
+  parent exploration. Only a terminal thread (completed, failed, or canceled) can restart; while
+  planning, execution, or analysis is still in flight this returns a 409 — cancel the thread
+  first, then restart.
 
   No `:event/exploration-update` is published: nothing on the Exploration row changes, so there
   is no revision to record (the revision push skips unchanged objects)."
@@ -509,25 +515,29 @@
   reflect the cancellation. EQ status changes are picked up via the existing `/queries` poll."
   [:map
    [:id           ms/PositiveInt]
-   [:canceled_at  [:maybe :any]]])
+   [:canceled_at  [:maybe :any]]
+   [:completed_at [:maybe :any]]])
 
 (api.macros/defendpoint :post "/thread/:thread-id/cancel" :- ::CanceledThread
-  "Cancel an in-flight exploration thread. Stamps `canceled_at` on the thread, and bulk-flips any
-  still-`pending` ExplorationQuery rows to `canceled`. In-flight queries currently mid-QP-execution
-  are left to run to natural completion — their result rows are orphaned but harmless.
+  "Cancel an in-flight exploration thread. Stamps `canceled_at` and `completed_at` on the thread,
+  and bulk-flips any still-`pending` ExplorationQuery rows to `canceled`. In-flight queries
+  currently mid-QP-execution are left to run to natural completion — their result rows are
+  orphaned but harmless (timeline scoring skips canceled threads).
 
-  Idempotent: a thread with `canceled_at IS NOT NULL` (already canceled) returns 200 with its
-  existing state. Authorization is the same write check as other thread-mutating endpoints."
+  Idempotent: a thread with `completed_at IS NOT NULL` (already terminal — natural completion or
+  prior cancel) returns 200 with its existing state. Authorization is the same write check as
+  other thread-mutating endpoints."
   [{:keys [thread-id]} :- [:map [:thread-id ms/PositiveInt]]]
   (write-check-thread thread-id)
   (let [now (t/offset-date-time)]
     (t2/with-transaction [_conn]
-      ;; CAS gate on `canceled_at IS NULL` makes an already-canceled thread a safe no-op. When this
-      ;; UPDATE matches 0 rows, the thread is already canceled.
+      ;; CAS gate on `completed_at IS NULL` makes both already-canceled and already-completed
+      ;; threads safe no-ops. When this UPDATE matches 0 rows, the thread is already terminal.
       (t2/update! :model/ExplorationThread
-                  :id          thread-id
-                  :canceled_at nil
-                  {:canceled_at now})
+                  :id           thread-id
+                  :completed_at nil
+                  {:canceled_at now
+                   :completed_at now})
       ;; Bulk-flip pending → canceled. SKIP LOCKED on Postgres/MySQL skips the row currently
       ;; held by an in-flight QP worker so this API call doesn't block on QP duration; that row
       ;; will commit as `done` (or `error`) naturally. H2 has only one worker (see worker-count
@@ -550,7 +560,7 @@
            {:update (t2/table-name :model/ExplorationQuery)
             :set    {:status "canceled"}
             :where  [:in :id pending-ids]})))))
-  (t2/select-one [:model/ExplorationThread :id :canceled_at] :id thread-id))
+  (t2/select-one [:model/ExplorationThread :id :canceled_at :completed_at] :id thread-id))
 
 (api.macros/defendpoint :get "/:id/queries" :- [:sequential ::ExplorationQuerySummary]
   "Lightweight list of queries for an exploration. Excludes `dataset_query` and the result blob —

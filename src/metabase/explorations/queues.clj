@@ -36,7 +36,8 @@
   "Terminal state for one query message: the row goes `error` with a message the UI renders, and the
   thread's completion gate is re-checked so the client stops polling."
   [{:keys [query-id]} error]
-  (runner/fail-query! query-id (ex-message error)))
+  (let [thread-id (runner/fail-query! query-id (ex-message error))]
+    (runner/maybe-complete-thread! thread-id)))
 
 (defn- record-failure!
   "Write one message's terminal-failure state via `fail!`, logging (never rethrowing) if that write
@@ -73,7 +74,10 @@
                (doseq [{:keys [thread-id]} messages]
                  ;; fail-plan! terminally stamps a thread that never planned, which is what stops
                  ;; the client polling it.
-                 (runner/fail-plan! thread-id (ex-message error))))})
+                 (runner/fail-plan! thread-id (ex-message error))
+                 ;; For a thread that *was* planned (this delivery was a failing duplicate), this
+                 ;; is the normal completion check; for one that wasn't, it's a no-op.
+                 (runner/maybe-complete-thread! thread-id)))})
 
 (mq/def-queue! :queue/exploration-query
   {:transactional :require
@@ -111,10 +115,14 @@
 (mq/def-listener! :queue/exploration-plan [messages]
   (doseq [{:keys [thread-id]} messages]
     (runner/plan-thread! thread-id)
-    (publish-pending-queries! thread-id)))
+    (publish-pending-queries! thread-id)
+    ;; A plan that produced no queries (nothing applicable, or a terminally-failed planner) is
+    ;; already finished — the gate is what tells the client to stop polling.
+    (runner/maybe-complete-thread! thread-id)))
 
 (mq/def-listener! :queue/exploration-query [messages]
   (deliver-batch! messages
                   (fn [{:keys [query-id]}]
-                    (runner/run-query! query-id))
+                    (when-let [thread-id (runner/run-query! query-id)]
+                      (runner/maybe-complete-thread! thread-id)))
                   fail-query-message!))

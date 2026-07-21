@@ -663,14 +663,16 @@
     {:thread-id (:id thread) :eq-ids eq-ids}))
 
 (deftest thread-cancel-sets-timestamps-and-flips-pending-test
-  (testing "POST /thread/:id/cancel stamps canceled_at and bulk-flips pending EQs"
+  (testing "POST /thread/:id/cancel stamps canceled_at + completed_at and bulk-flips pending EQs"
     (mt/with-model-cleanup [:model/ExplorationQuery :model/ExplorationThread :model/Exploration :model/Card]
       (let [{:keys [thread-id eq-ids]} (minimal-cancel-fixture! (mt/user->id :rasta) 3)
             resp (mt/user-http-request :rasta :post 200 (str "exploration/thread/" thread-id "/cancel"))]
         (is (= thread-id (:id resp)))
         (is (some? (:canceled_at resp)))
+        (is (some? (:completed_at resp)))
         (let [thread (t2/select-one :model/ExplorationThread :id thread-id)]
-          (is (some? (:canceled_at thread))))
+          (is (some? (:canceled_at thread)))
+          (is (some? (:completed_at thread))))
         (is (every? #(= "canceled" %)
                     (map :status (t2/select :model/ExplorationQuery :id [:in eq-ids])))
             "all pending EQs are flipped to canceled")))))
@@ -683,6 +685,19 @@
             second-resp (mt/user-http-request :rasta :post 200 (str "exploration/thread/" thread-id "/cancel"))]
         (is (= (:canceled_at first-resp) (:canceled_at second-resp))
             "second cancel must not overwrite the original canceled_at — the CAS WHERE clause matched 0 rows")))))
+
+(deftest thread-cancel-idempotent-on-completed-test
+  (testing "cancelling a thread whose completed_at is already set (natural finish) is a 200 no-op
+            that leaves canceled_at NULL"
+    (mt/with-model-cleanup [:model/ExplorationQuery :model/ExplorationThread :model/Exploration :model/Card]
+      (let [{:keys [thread-id]} (minimal-cancel-fixture! (mt/user->id :rasta) 1)
+            _    (t2/update! :model/ExplorationThread thread-id
+                             {:completed_at (t/offset-date-time)})
+            resp (mt/user-http-request :rasta :post 200 (str "exploration/thread/" thread-id "/cancel"))]
+        (is (nil? (:canceled_at resp))
+            "naturally-completed thread keeps canceled_at NULL — cancel was a no-op")
+        (is (some? (:completed_at resp))
+            "completed_at is still set from the natural finish")))))
 
 (deftest thread-cancel-requires-write-perm-test
   (testing "cancel requires write perm on the parent exploration's collection"
@@ -735,7 +750,8 @@
         ;; Simulate a finished run so we can prove restart clears the terminal-state gates.
         (t2/update! :model/ExplorationThread orig-tid
                     {:query_plan_started_at (t/offset-date-time)
-                     :canceled_at           (t/offset-date-time)})
+                     :analysis_started_at   (t/offset-date-time)
+                     :completed_at          (t/offset-date-time)})
         (let [resp     (mt/user-http-request u :post 200 (format "exploration/thread/%d/restart" orig-tid))
               threads  (:threads resp)
               rerun    (first threads)]
@@ -743,7 +759,8 @@
           (is (= orig-tid (:id rerun)) "it re-runs the same thread")
           (is (some? (:started_at rerun)) "started_at re-stamped so the planner re-claims it")
           (is (nil? (:query_plan_started_at rerun)) "plan-claim gate cleared")
-          (is (nil? (:canceled_at rerun)) "terminal gate cleared")
+          (is (nil? (:analysis_started_at rerun)) "analysis-claim gate cleared")
+          (is (nil? (:completed_at rerun)) "completion gate cleared")
           (is (empty? (:queries rerun)) "previously generated queries are wiped")
           (testing "selections are preserved"
             ;; Selections live in the thread's ExplorationBlock rows, which restart does
@@ -772,7 +789,7 @@
             tid     (-> created :threads first :id)]
         ;; Perms ride the thread's parent exploration, resolved by `write-check-thread`.
         ;; Mark the thread terminal — restart refuses in-flight threads with a 409.
-        (t2/update! :model/ExplorationThread tid {:canceled_at (t/offset-date-time)})
+        (t2/update! :model/ExplorationThread tid {:completed_at (t/offset-date-time)})
         (mt/user-http-request other :post 403 (format "exploration/thread/%d/restart" tid))
         (let [resp (mt/user-http-request owner :post 200 (format "exploration/thread/%d/restart" tid))]
           (is (= 1 (count (:threads resp))) "still a single thread after restart"))))))
@@ -789,12 +806,12 @@
               drill    (first (t2/insert-returning-instances!
                                :model/ExplorationThread
                                {:exploration_id expl-id :name "drill" :position 1
-                                :canceled_at    (t/offset-date-time)}))]
-          (t2/update! :model/ExplorationThread root-tid {:canceled_at (t/offset-date-time)})
+                                :completed_at   (t/offset-date-time)}))]
+          (t2/update! :model/ExplorationThread root-tid {:completed_at (t/offset-date-time)})
           (mt/user-http-request u :post 200 (format "exploration/thread/%d/restart" root-tid))
-          (is (nil? (t2/select-one-fn :canceled_at :model/ExplorationThread :id root-tid))
+          (is (nil? (t2/select-one-fn :completed_at :model/ExplorationThread :id root-tid))
               "the named (root) thread was reset")
-          (is (some? (t2/select-one-fn :canceled_at :model/ExplorationThread :id (:id drill)))
+          (is (some? (t2/select-one-fn :completed_at :model/ExplorationThread :id (:id drill)))
               "the newest thread was left alone"))))))
 
 (deftest exploration-restart-404s-on-unknown-thread-test
@@ -853,10 +870,11 @@
               "its materialized queries are untouched"))
         (testing "a canceled thread with a query still mid-QP-execution returns 409"
           (t2/update! :model/ExplorationThread tid
-                      {:canceled_at (t/offset-date-time)})
+                      {:canceled_at  (t/offset-date-time)
+                       :completed_at (t/offset-date-time)})
           (t2/update! :model/ExplorationQuery eq-id {:status "running" :started_at (t/offset-date-time)})
           (mt/user-http-request u :post 409 (format "exploration/thread/%d/restart" tid))
-          (is (some? (t2/select-one-fn :canceled_at :model/ExplorationThread :id tid))
+          (is (some? (t2/select-one-fn :completed_at :model/ExplorationThread :id tid))
               "the terminal stamp survives — nothing was reset"))
         (testing "once no query is mid-execution, restart succeeds and leaves the thread claimable"
           (t2/update! :model/ExplorationQuery eq-id {:status "canceled"})
@@ -866,5 +884,7 @@
             ;; started_at set, every other lifecycle timestamp NULL, zero exploration_query rows.
             (is (some? (:started_at thread)))
             (is (nil? (:query_plan_started_at thread)))
+            (is (nil? (:analysis_started_at thread)))
+            (is (nil? (:completed_at thread)))
             (is (nil? (:canceled_at thread)))
             (is (zero? (t2/count :model/ExplorationQuery :exploration_thread_id tid)))))))))

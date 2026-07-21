@@ -331,15 +331,16 @@
 
 ;; ---------------------------- Cancellation guards ----------------------------
 
+(def ^:private claim-analysis-if-ready! #'runner/claim-analysis-if-ready!)
 (def ^:private canceled-mid-plan-cleanup! #'runner/canceled-mid-plan-cleanup!)
 
 (defn- cancel-thread!
-  "Stamp `canceled_at` directly on the thread, the way the cancel endpoint does.
+  "Stamp `canceled_at` + `completed_at` directly on the thread, the way the cancel endpoint does.
   Bypasses the API to keep these tests focused on the runner-side guards."
   [thread-id]
   (let [now (OffsetDateTime/now)]
     (t2/update! :model/ExplorationThread thread-id
-                {:canceled_at now})))
+                {:canceled_at now :completed_at now})))
 
 (deftest run-query-skips-canceled-thread-test
   (testing "A delivered query whose thread was canceled after the message was published is a no-op:
@@ -356,46 +357,6 @@
             "run-query! must not execute a query on a canceled thread")
         (is (zero? (t2/count :model/ExplorationQueryResult :exploration_query_id (:id row)))
             "no result was written")))))
-
-(deftest plan-thread-skips-canceled-test
-  (testing "A started thread that was canceled before its plan message was delivered is not planned"
-    (mt/with-temp [:model/User u {:email "cancel-plan@example.com"}]
-      (let [thread (temp-thread! (:id u))
-            called (atom 0)]
-        (t2/update! :model/ExplorationThread (:id thread) {:started_at (OffsetDateTime/now)})
-        (cancel-thread! (:id thread))
-        (mt/with-dynamic-fn-redefs [metabase.explorations.query-plan/generate-query-plan!
-                                    (fn [_] (swap! called inc) :ok)]
-          (is (false? (runner/plan-thread! (:id thread)))))
-        (is (zero? @called) "the planner (and its LLM call) must not run for a canceled thread")))))
-
-(deftest canceled-mid-plan-cleanup-flips-pending-rows-test
-  (testing "Planner-race repair: when the planner finishes for a thread the user canceled mid-plan,
-            the cleanup helper flips the just-inserted pending rows to canceled"
-    (mt/with-temp [:model/User u {:email "cancel-cleanup@example.com"}
-                   :model/Card card {:type :metric
-                                     :creator_id (:id u)
-                                     :dataset_query (lib/->legacy-MBQL (let [mp (mt/metadata-provider)] (-> (lib/query mp (lib.metadata/table mp (mt/id :venues))) (lib/aggregate (lib/count)))))}]
-      (let [thread     (temp-thread! (:id u))
-            pending-eq (pending-query! (:id thread) (:id card)
-                                       (lib/->legacy-MBQL (let [mp (mt/metadata-provider)] (-> (lib/query mp (lib.metadata/table mp (mt/id :venues))) (lib/aggregate (lib/count))))))]
-        (cancel-thread! (:id thread))
-        (canceled-mid-plan-cleanup! (:id thread))
-        (is (= "canceled" (:status (t2/select-one :model/ExplorationQuery :id (:id pending-eq))))
-            "pending EQ on a canceled thread must be flipped to canceled")))))
-
-(deftest canceled-mid-plan-cleanup-noop-on-uncanceled-test
-  (testing "cleanup helper does nothing for threads that aren't canceled — common-case no-op"
-    (mt/with-temp [:model/User u {:email "cancel-cleanup-noop@example.com"}
-                   :model/Card card {:type :metric
-                                     :creator_id (:id u)
-                                     :dataset_query (lib/->legacy-MBQL (let [mp (mt/metadata-provider)] (-> (lib/query mp (lib.metadata/table mp (mt/id :venues))) (lib/aggregate (lib/count)))))}]
-      (let [thread     (temp-thread! (:id u))
-            pending-eq (pending-query! (:id thread) (:id card)
-                                       (lib/->legacy-MBQL (let [mp (mt/metadata-provider)] (-> (lib/query mp (lib.metadata/table mp (mt/id :venues))) (lib/aggregate (lib/count))))))]
-        (canceled-mid-plan-cleanup! (:id thread))
-        (is (= "pending" (:status (t2/select-one :model/ExplorationQuery :id (:id pending-eq))))
-            "pending EQ on a live thread must be left alone")))))
 
 (deftest run-query-is-idempotent-under-redelivery-test
   (testing "at-least-once: re-delivering a query that already ran does not run it twice or write a
@@ -441,6 +402,62 @@
             "exactly one result row")
         (is (= "done" (:status (t2/select-one :model/ExplorationQuery :id (:id row)))))))))
 
+(deftest plan-thread-skips-canceled-test
+  (testing "A started thread that was canceled before its plan message was delivered is not planned"
+    (mt/with-temp [:model/User u {:email "cancel-plan@example.com"}]
+      (let [thread (temp-thread! (:id u))
+            called (atom 0)]
+        (t2/update! :model/ExplorationThread (:id thread) {:started_at (OffsetDateTime/now)})
+        (cancel-thread! (:id thread))
+        (mt/with-dynamic-fn-redefs [metabase.explorations.query-plan/generate-query-plan!
+                                    (fn [_] (swap! called inc) :ok)]
+          (is (false? (runner/plan-thread! (:id thread)))))
+        (is (zero? @called) "the planner (and its LLM call) must not run for a canceled thread")))))
+
+(deftest claim-analysis-skips-canceled-test
+  (testing "claim-analysis-if-ready! refuses to CAS analysis_started_at on a canceled thread,
+            even when every query is terminal and every timeline pair is scored"
+    (mt/with-temp [:model/User u {:email "cancel-analysis@example.com"}]
+      (let [thread (temp-thread! (:id u))]
+        ;; Set started_at so the thread is past the draft phase. No EQs and no timeline pairs
+        ;; means the two NOT-EXISTS predicates trivially hold — without canceled_at IS NULL, the
+        ;; CAS would fire.
+        (t2/update! :model/ExplorationThread (:id thread)
+                    {:started_at (OffsetDateTime/now)})
+        (cancel-thread! (:id thread))
+        (is (false? (claim-analysis-if-ready! (:id thread)))
+            "CAS must not fire on a canceled thread")
+        (is (nil? (:analysis_started_at (t2/select-one :model/ExplorationThread :id (:id thread))))
+            "analysis_started_at must remain NULL")))))
+
+(deftest canceled-mid-plan-cleanup-flips-pending-rows-test
+  (testing "Planner-race repair: when the planner finishes for a thread the user canceled mid-plan,
+            the cleanup helper flips the just-inserted pending rows to canceled"
+    (mt/with-temp [:model/User u {:email "cancel-cleanup@example.com"}
+                   :model/Card card {:type :metric
+                                     :creator_id (:id u)
+                                     :dataset_query (lib/->legacy-MBQL (let [mp (mt/metadata-provider)] (-> (lib/query mp (lib.metadata/table mp (mt/id :venues))) (lib/aggregate (lib/count)))))}]
+      (let [thread     (temp-thread! (:id u))
+            pending-eq (pending-query! (:id thread) (:id card)
+                                       (lib/->legacy-MBQL (let [mp (mt/metadata-provider)] (-> (lib/query mp (lib.metadata/table mp (mt/id :venues))) (lib/aggregate (lib/count))))))]
+        (cancel-thread! (:id thread))
+        (canceled-mid-plan-cleanup! (:id thread))
+        (is (= "canceled" (:status (t2/select-one :model/ExplorationQuery :id (:id pending-eq))))
+            "pending EQ on a canceled thread must be flipped to canceled")))))
+
+(deftest canceled-mid-plan-cleanup-noop-on-uncanceled-test
+  (testing "cleanup helper does nothing for threads that aren't canceled — common-case no-op"
+    (mt/with-temp [:model/User u {:email "cancel-cleanup-noop@example.com"}
+                   :model/Card card {:type :metric
+                                     :creator_id (:id u)
+                                     :dataset_query (lib/->legacy-MBQL (let [mp (mt/metadata-provider)] (-> (lib/query mp (lib.metadata/table mp (mt/id :venues))) (lib/aggregate (lib/count)))))}]
+      (let [thread     (temp-thread! (:id u))
+            pending-eq (pending-query! (:id thread) (:id card)
+                                       (lib/->legacy-MBQL (let [mp (mt/metadata-provider)] (-> (lib/query mp (lib.metadata/table mp (mt/id :venues))) (lib/aggregate (lib/count))))))]
+        (canceled-mid-plan-cleanup! (:id thread))
+        (is (= "pending" (:status (t2/select-one :model/ExplorationQuery :id (:id pending-eq))))
+            "pending EQ on a live thread must be left alone")))))
+
 ;; ---------------------------- Planner idempotency & crash recovery ----------------------------
 
 (deftest plan-thread-skips-an-already-planned-thread-test
@@ -477,6 +494,61 @@
           (is (true? (runner/plan-thread! (:id thread)))
               "the redelivered message re-plans it"))
         (is (= 1 @called))))))
+
+(deftest plan-thread-skips-a-completed-thread-that-produced-no-queries-test
+  (testing "at-least-once: a plan that produced no queries still completes its thread (the analysis
+            claim fires on a thread with no pending queries). A redelivered plan message for such a
+            thread must not re-run the planner and resurrect a completed exploration — the query-row
+            check can't catch the zero-query case, so analysis_started_at is the gate that does"
+    (mt/with-temp [:model/User u {:email "plan-zero-query@example.com"}]
+      (let [thread (temp-thread! (:id u))
+            called (atom 0)]
+        ;; the thread planned, produced no queries, and its analysis was already claimed/completed
+        (t2/update! :model/ExplorationThread (:id thread)
+                    {:started_at          (OffsetDateTime/now)
+                     :analysis_started_at (OffsetDateTime/now)})
+        (mt/with-dynamic-fn-redefs [metabase.explorations.query-plan/generate-query-plan!
+                                    (fn [_] (swap! called inc) :ok)]
+          (is (false? (runner/plan-thread! (:id thread)))))
+        (is (zero? @called)
+            "the planner must not re-run for a thread whose analysis already completed")))))
+
+(deftest fail-plan-records-the-terminal-planning-failure-test
+  (testing "when the queue gives up on planning, fail-plan! writes the same terminal state the
+            planner's own failure path does — transcript + terminal stamp — so the client stops
+            polling and the failure is diagnosable"
+    (mt/with-temp [:model/User u {:email "fail-plan@example.com"}]
+      (let [thread (temp-thread! (:id u))]
+        (t2/update! :model/ExplorationThread (:id thread) {:started_at (OffsetDateTime/now)})
+        (runner/fail-plan! (:id thread) "the queue gave up")
+        (let [after (t2/select-one :model/ExplorationThread :id (:id thread))]
+          (is (some? (:completed_at after))
+              "the thread is terminally stamped, so the client stops polling")
+          (is (some? (:analysis_started_at after))
+              "and the AI-summary machinery can't claim a thread that never planned")
+          (is (= :error (:outcome (:query_plan_transcript after)))
+              "the transcript records the terminal outcome")
+          (is (= "the queue gave up" (:error (:query_plan_transcript after)))
+              "with the error that exhausted the retries"))))))
+
+(deftest fail-plan-leaves-a-planned-thread-alone-test
+  (testing "a thread that already has query rows was successfully planned — a failing *duplicate*
+            plan delivery must not stamp 'planning failed' over work that is genuinely in flight"
+    (mt/with-temp [:model/User u {:email "fail-plan-dup@example.com"}
+                   :model/Card card {:type :metric
+                                     :creator_id (:id u)
+                                     :dataset_query (lib/->legacy-MBQL (let [mp (mt/metadata-provider)] (-> (lib/query mp (lib.metadata/table mp (mt/id :venues))) (lib/aggregate (lib/count)))))}]
+      (let [thread (temp-thread! (:id u))]
+        (t2/update! :model/ExplorationThread (:id thread) {:started_at (OffsetDateTime/now)})
+        (pending-query! (:id thread) (:id card)
+                        (lib/->legacy-MBQL (let [mp (mt/metadata-provider)] (-> (lib/query mp (lib.metadata/table mp (mt/id :venues))) (lib/aggregate (lib/count))))))
+        (runner/fail-plan! (:id thread) "a duplicate delivery ran out of retries")
+        (let [after (t2/select-one :model/ExplorationThread :id (:id thread))]
+          (is (nil? (:completed_at after))
+              "the thread is not completed out from under its pending queries")
+          (is (nil? (:analysis_started_at after)))
+          (is (nil? (:query_plan_transcript after))
+              "and no failure transcript is written — planning did not fail"))))))
 
 ;; ---------------------------- Queue metrics (fix #4) ----------------------------
 
