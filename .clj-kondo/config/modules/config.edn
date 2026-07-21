@@ -1016,8 +1016,7 @@
 
   explorations
   {:team "UX West"
-   :api  #{metabase.explorations.api
-           metabase.explorations.init}
+   :api  #{metabase.explorations.api metabase.explorations.core metabase.explorations.init}
    :uses #{analytics
            analytics-interface
            api
@@ -1374,6 +1373,7 @@
               documents
               driver
               entity-retrieval
+              explorations
               interestingness
               legacy-mbql
               lib
@@ -1396,6 +1396,7 @@
               sync
               system
               task
+              timeline
               transforms
               transforms-base
               util
