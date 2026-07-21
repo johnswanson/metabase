@@ -17,6 +17,7 @@
    [metabase.query-processor.pipeline :as qp.pipeline]
    [metabase.query-processor.streaming :as qp.streaming]
    [metabase.request.core :as request]
+   [metabase.util.i18n :refer [tru]]
    [metabase.util.malli.registry :as mr]
    [metabase.util.malli.schema :as ms]
    [toucan2.core :as t2])
@@ -63,6 +64,40 @@
     (t2/insert! :model/ExplorationBlock
                 (positional-rows thread-id
                                  (map #(select-keys % [:type :metrics :dimensions]) blocks)))))
+
+(defn- reset-thread-for-rerun!
+  "CAS-reset a *terminal* thread (`canceled_at` set) back to the freshly-started state a new plan
+  run expects: `started_at` set, every other lifecycle timestamp NULL, and zero `exploration_query`
+  rows. On success it enqueues a fresh planning message (`explorations.queues/start-thread!`) inside
+  the same transaction, so planning re-runs iff the reset committed. Returns true when the reset
+  applied; false when the guarded UPDATE matched no row.
+
+  The guard refuses while the thread is still in flight: not yet terminal, or a query worker still
+  holds a `running` row (possible on a canceled thread, whose in-flight queries run to natural
+  completion). A restart racing in-flight work could otherwise strand query rows a still-running
+  planner inserts after the reset, or let an in-flight query worker's completion CAS stamp the
+  freshly-reset thread."
+  [thread-id]
+  (t2/with-transaction [_conn]
+    (when (pos? (t2/query-one
+                 {:update :exploration_thread
+                  :set    {:started_at            (t/offset-date-time)
+                           :query_plan_started_at nil
+                           :query_plan_transcript nil
+                           :canceled_at           nil}
+                  :where  [:and
+                           [:= :id thread-id]
+                           [:not= :canceled_at nil]
+                           [:not-exists {:select [1]
+                                         :from   [:exploration_query]
+                                         :where  [:and
+                                                  [:= :exploration_thread_id thread-id]
+                                                  [:= :status "running"]]}]]}))
+      (t2/delete! :model/ExplorationQuery :exploration_thread_id thread-id)
+      ;; Enqueue planning inside the reset transaction so the plan message publishes iff the reset
+      ;; commits (:queue/exploration-plan is :transactional :require).
+      (explorations.queues/start-thread! thread-id)
+      true)))
 
 ;;; ----------------------------------------- schemas -----------------------------------------
 
@@ -430,6 +465,22 @@
   (let [thread (get-thread-or-404 thread-id)]
     (api/write-check (get-exploration-or-404 (:exploration_id thread)))
     thread))
+
+(api.macros/defendpoint :post "/thread/:thread-id/restart" :- ::HydratedExploration
+  "Re-run one exploration thread in place, keeping its selections: drops the thread's materialized
+  queries and clears the terminal-state gates so the background planner re-claims it. Returns the
+  parent exploration. Only a terminal (canceled) thread can restart; while planning or execution is
+  still in flight this returns a 409 — cancel the thread first, then restart.
+
+  No `:event/exploration-update` is published: nothing on the Exploration row changes, so there
+  is no revision to record (the revision push skips unchanged objects)."
+  [{:keys [thread-id]} :- [:map [:thread-id ms/PositiveInt]]]
+  (let [thread      (get-thread-or-404 thread-id)
+        exploration (api/write-check (get-exploration-or-404 (:exploration_id thread)))]
+    (when-not (reset-thread-for-rerun! thread-id)
+      (throw (ex-info (tru "Exploration is still running; cancel it before restarting.")
+                      {:status-code 409})))
+    (hydrate-exploration exploration)))
 
 (mr/def ::CanceledThread
   "Schema for the cancel endpoint response — just the state-bearing fields the FE needs to
