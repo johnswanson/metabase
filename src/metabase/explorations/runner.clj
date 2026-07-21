@@ -67,7 +67,8 @@
                   :join   [[:exploration_thread :et] [:= :et.id :eq.exploration_thread_id]]
                   :where  [:and
                            [:= :eq.id query-id]
-                           [:= :eq.status "pending"]]}))
+                           [:= :eq.status "pending"]
+                           [:= :et.canceled_at nil]]}))
 
 (defn- serialize-result
   "Run `cache.impl/do-with-serialization` against a single QP result, returning the gzipped+nippy
@@ -292,23 +293,43 @@
       (record-query-outcome! "error"))
     thread-id))
 
+(defn- canceled-mid-plan-cleanup!
+  "Planner-race repair: the user can cancel a thread *after* the plan message was published but
+  *before* the planner inserted its rows. The cancel endpoint's bulk pending→canceled UPDATE only
+  saw the rows that existed at cancel time; rows the planner inserted after that are still `pending`
+  on a canceled thread. Flip them so the query table matches its owning thread's terminal state."
+  [thread-id]
+  (when (t2/exists? :model/ExplorationThread :id thread-id :canceled_at [:not= nil])
+    (t2/update! :model/ExplorationQuery
+                {:exploration_thread_id thread-id
+                 :status                "pending"}
+                {:status "canceled"})))
+
 (defn plan-thread!
   "Run the LLM planner for `thread-id`, materializing its `ExplorationQuery` rows. Idempotent for MQ."
   [thread-id]
-  (let [thread (t2/select-one [:model/ExplorationThread :id] :id thread-id)]
-    (cond
-      ;; `restart` deletes and re-creates a thread's work; a message for a thread that
-      ;; no longer exists is a no-op.
-      (nil? thread)
-      false
+  (let [thread   (t2/select-one [:model/ExplorationThread :id :canceled_at] :id thread-id)
+        planned? (cond
+                   ;; `restart` deletes and re-creates a thread's work; a message for a thread that
+                   ;; no longer exists is a no-op.
+                   (nil? thread)
+                   false
 
-      (t2/exists? :model/ExplorationQuery :exploration_thread_id thread-id)
-      (do (log/infof "Exploration thread %d is already planned; skipping" thread-id)
-          false)
+                   ;; The user canceled between publishing the message and delivering it. Don't
+                   ;; spend an LLM call on work nobody is waiting for.
+                   (:canceled_at thread)
+                   (do (log/infof "Exploration thread %d was canceled; skipping planning" thread-id)
+                       false)
 
-      :else
-      (do (explorations.query-plan/generate-query-plan! thread-id)
-          true))))
+                   (t2/exists? :model/ExplorationQuery :exploration_thread_id thread-id)
+                   (do (log/infof "Exploration thread %d is already planned; skipping" thread-id)
+                       false)
+
+                   :else
+                   (do (explorations.query-plan/generate-query-plan! thread-id)
+                       true))]
+    (canceled-mid-plan-cleanup! thread-id)
+    planned?))
 
 (defn fail-plan!
   "Durably record that the queue gave up on planning `thread-id`: write the same terminal state
@@ -317,9 +338,11 @@
   `message` is the error that exhausted the retries.
 
   A thread that already has query rows is left alone - planning succeeded there, and a failing
-  duplicate delivery must not stamp 'planning failed' over work that is in flight."
+  duplicate delivery must not stamp 'planning failed' over work that is in flight. Also flips any
+  rows a canceled thread left `pending`."
   [thread-id message]
-  (explorations.query-plan/record-terminal-planning-failure! thread-id message))
+  (explorations.query-plan/record-terminal-planning-failure! thread-id message)
+  (canceled-mid-plan-cleanup! thread-id))
 
 (defn pending-query-ids
   "Ids of `thread-id`'s queries still awaiting execution."

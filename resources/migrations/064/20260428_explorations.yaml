@@ -820,6 +820,21 @@ databaseChangeLog:
             columnDataType: char(21)
 
   - changeSet:
+      id: v64.expthreadcancelat
+      author: johnswanson
+      comment: Add exploration_thread.canceled_at
+      changes:
+        - addColumn:
+            tableName: exploration_thread
+            columns:
+              - column:
+                  name: canceled_at
+                  type: ${timestamp_type}
+                  remarks: Set when the user stops a running thread via the cancel endpoint. Set together with `completed_at` so existing terminal-state predicates keep working; `canceled_at IS NOT NULL` is the cause marker that distinguishes a cancel from a natural completion.
+                  constraints:
+                    nullable: true
+
+  - changeSet:
       id: v64.expblocktable
       author: johnswanson
       comment: Create exploration_block table

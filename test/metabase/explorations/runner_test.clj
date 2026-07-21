@@ -195,6 +195,74 @@
                                           :rows [["a" 1] ["b" 2]]}})
     q))
 
+;; ---------------------------- Cancellation guards ----------------------------
+
+(def ^:private canceled-mid-plan-cleanup! #'runner/canceled-mid-plan-cleanup!)
+
+(defn- cancel-thread!
+  "Stamp `canceled_at` directly on the thread, the way the cancel endpoint does.
+  Bypasses the API to keep these tests focused on the runner-side guards."
+  [thread-id]
+  (let [now (OffsetDateTime/now)]
+    (t2/update! :model/ExplorationThread thread-id
+                {:canceled_at now})))
+
+(deftest run-query-skips-canceled-thread-test
+  (testing "A delivered query whose thread was canceled after the message was published is a no-op:
+            it must not run, and the row is left for the cancel flip rather than being executed"
+    (mt/with-temp [:model/User u {:email "cancel-claim@example.com"}
+                   :model/Card card {:type :metric
+                                     :creator_id (:id u)
+                                     :dataset_query (lib/->legacy-MBQL (let [mp (mt/metadata-provider)] (-> (lib/query mp (lib.metadata/table mp (mt/id :venues))) (lib/aggregate (lib/count)))))}]
+      (let [thread (temp-thread! (:id u))
+            row    (pending-query! (:id thread) (:id card)
+                                   (lib/->legacy-MBQL (let [mp (mt/metadata-provider)] (-> (lib/query mp (lib.metadata/table mp (mt/id :venues))) (lib/aggregate (lib/count))))))]
+        (cancel-thread! (:id thread))
+        (is (nil? (runner/run-query! (:id row)))
+            "run-query! must not execute a query on a canceled thread")
+        (is (zero? (t2/count :model/ExplorationQueryResult :exploration_query_id (:id row)))
+            "no result was written")))))
+
+(deftest plan-thread-skips-canceled-test
+  (testing "A started thread that was canceled before its plan message was delivered is not planned"
+    (mt/with-temp [:model/User u {:email "cancel-plan@example.com"}]
+      (let [thread (temp-thread! (:id u))
+            called (atom 0)]
+        (t2/update! :model/ExplorationThread (:id thread) {:started_at (OffsetDateTime/now)})
+        (cancel-thread! (:id thread))
+        (mt/with-dynamic-fn-redefs [metabase.explorations.query-plan/generate-query-plan!
+                                    (fn [_] (swap! called inc) :ok)]
+          (is (false? (runner/plan-thread! (:id thread)))))
+        (is (zero? @called) "the planner (and its LLM call) must not run for a canceled thread")))))
+
+(deftest canceled-mid-plan-cleanup-flips-pending-rows-test
+  (testing "Planner-race repair: when the planner finishes for a thread the user canceled mid-plan,
+            the cleanup helper flips the just-inserted pending rows to canceled"
+    (mt/with-temp [:model/User u {:email "cancel-cleanup@example.com"}
+                   :model/Card card {:type :metric
+                                     :creator_id (:id u)
+                                     :dataset_query (lib/->legacy-MBQL (let [mp (mt/metadata-provider)] (-> (lib/query mp (lib.metadata/table mp (mt/id :venues))) (lib/aggregate (lib/count)))))}]
+      (let [thread     (temp-thread! (:id u))
+            pending-eq (pending-query! (:id thread) (:id card)
+                                       (lib/->legacy-MBQL (let [mp (mt/metadata-provider)] (-> (lib/query mp (lib.metadata/table mp (mt/id :venues))) (lib/aggregate (lib/count))))))]
+        (cancel-thread! (:id thread))
+        (canceled-mid-plan-cleanup! (:id thread))
+        (is (= "canceled" (:status (t2/select-one :model/ExplorationQuery :id (:id pending-eq))))
+            "pending EQ on a canceled thread must be flipped to canceled")))))
+
+(deftest canceled-mid-plan-cleanup-noop-on-uncanceled-test
+  (testing "cleanup helper does nothing for threads that aren't canceled — common-case no-op"
+    (mt/with-temp [:model/User u {:email "cancel-cleanup-noop@example.com"}
+                   :model/Card card {:type :metric
+                                     :creator_id (:id u)
+                                     :dataset_query (lib/->legacy-MBQL (let [mp (mt/metadata-provider)] (-> (lib/query mp (lib.metadata/table mp (mt/id :venues))) (lib/aggregate (lib/count)))))}]
+      (let [thread     (temp-thread! (:id u))
+            pending-eq (pending-query! (:id thread) (:id card)
+                                       (lib/->legacy-MBQL (let [mp (mt/metadata-provider)] (-> (lib/query mp (lib.metadata/table mp (mt/id :venues))) (lib/aggregate (lib/count))))))]
+        (canceled-mid-plan-cleanup! (:id thread))
+        (is (= "pending" (:status (t2/select-one :model/ExplorationQuery :id (:id pending-eq))))
+            "pending EQ on a live thread must be left alone")))))
+
 (deftest run-query-is-idempotent-under-redelivery-test
   (testing "at-least-once: re-delivering a query that already ran does not run it twice or write a
             second exploration_query_result (which is 1:1 with the query). It still returns the
