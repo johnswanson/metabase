@@ -169,6 +169,65 @@
         (is (zero? (count (-> resp :threads first :metrics))))
         (is (zero? (count (-> resp :threads first :queries))))))))
 
+(defn- valid-metric-card [user-id]
+  {:type          :metric
+   :creator_id    user-id
+   :dataset_query (lib/->legacy-MBQL (let [mp (mt/metadata-provider)] (-> (lib/query mp (lib.metadata/table mp (mt/id :venues))) (lib/aggregate (lib/count)))))})
+
+(deftest exploration-create-persists-blocks-verbatim-test
+  (testing "POST / persists each :blocks entry as its own ExplorationBlock row — no dedup across blocks"
+    (mt/with-temp [:model/User u {:email "groups@example.com"}
+                   :model/Card metric (valid-metric-card (:id u))]
+      (let [mapping [{:dimension_id "d1"
+                      :table_id (mt/id :venues)
+                      :target ["field" {} (mt/id :venues :price)]}]
+            ;; Two blocks sharing the same metric: a metric block (metric + d1) and a
+            ;; dimension block (the same metric, with d2). Each block is stored verbatim —
+            ;; the shared metric is NOT deduped across blocks.
+            body {:name         "Blocked create"
+                  :prompt       "via blocks"
+                  :blocks       [{:type       "metric"
+                                  :metrics    [{:card_id (:id metric) :dimension_mappings mapping}]
+                                  :dimensions [{:dimension_id "d1" :display_name "Price"
+                                                :effective_type "type/Number"}]}
+                                 {:type       "dimension"
+                                  :metrics    [{:card_id (:id metric) :dimension_mappings mapping}]
+                                  :dimensions [{:dimension_id "d2" :display_name "Category"
+                                                :effective_type "type/Text"}]}]}
+            resp   (mt/user-http-request u :post 200 "exploration" body)
+            tid    (-> resp :threads first :id)
+            blocks (t2/select :model/ExplorationBlock
+                              :exploration_thread_id tid {:order-by [[:position :asc]]})]
+        (is (= "Blocked create" (:name resp)))
+        (is (= 2 (count blocks)) "one row per block, no dedup")
+        (is (= ["metric" "dimension"] (map :type blocks)) "anchor type stored in payload order")
+        (is (= [0 1] (map :position blocks)))
+        (testing "each block keeps its own metrics + dimensions selection"
+          (is (= [(:id metric) (:id metric)] (map #(-> % :metrics first :card_id) blocks)))
+          (is (= ["d1" "d2"] (map #(-> % :dimensions first :dimension_id) blocks))))))))
+
+(deftest create-checks-block-card-permissions-test
+  (testing "POST / read-checks every metric card referenced by the blocks payload"
+    (mt/with-temp [:model/User u {:email "block-card-perms@example.com"}
+                   :model/Collection hidden {:name "hidden-metrics"}
+                   :model/Card secret (assoc (valid-metric-card (mt/user->id :crowberto))
+                                             :collection_id (:id hidden))]
+      ;; Temp collections auto-grant All Users read-write; revoke it so the caller genuinely
+      ;; cannot read the metric card.
+      (perms/revoke-collection-permissions! (perms-group/all-users) (:id hidden))
+      (let [base {:name          "block perm check"
+                  :collection_id (:id (collection/user->personal-collection (:id u)))}]
+        (testing "an unreadable card id is a 403"
+          (mt/user-http-request u :post 403 "exploration"
+                                (assoc base :blocks [{:type    "metric"
+                                                      :metrics [{:card_id (:id secret)}]}])))
+        (testing "a nonexistent card id is a 404"
+          (mt/user-http-request u :post 404 "exploration"
+                                (assoc base :blocks [{:type    "metric"
+                                                      :metrics [{:card_id Integer/MAX_VALUE}]}])))
+        (testing "nothing was persisted by the rejected requests"
+          (is (zero? (t2/count :model/Exploration :name "block perm check"))))))))
+
 (deftest exploration-get-permissions-test
   (testing "Only the creator (or a superuser) can GET an exploration"
     (mt/with-temp [:model/User owner {:email "p-owner@example.com"}

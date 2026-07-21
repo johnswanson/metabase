@@ -468,6 +468,36 @@ databaseChangeLog:
                   name: status
 
   - changeSet:
+      id: v64.qplanstate
+      author: johnswanson
+      comment: Add query_plan_started_at column to exploration_thread
+      changes:
+        - addColumn:
+            tableName: exploration_thread
+            columns:
+              - column:
+                  name: query_plan_started_at
+                  type: ${timestamp_type}
+                  remarks: CAS-claim marker for the background query-planning step. Set by the planning worker the moment it begins; subsequent workers skip threads whose marker is already set so planning runs exactly once per thread.
+                  constraints:
+                    nullable: true
+
+  - changeSet:
+      id: v64.h9yuhk
+      author: johnswanson
+      comment: Add query_plan_transcript column to exploration_thread
+      changes:
+        - addColumn:
+            tableName: exploration_thread
+            columns:
+              - column:
+                  name: query_plan_transcript
+                  type: ${text.type}
+                  remarks: EDN-encoded transcript of the planning run (planner, outcome, validation errors, final plan) used to materialize this thread's exploration_query rows. Debug-only — not surfaced to the user.
+                  constraints:
+                    nullable: true
+
+  - changeSet:
       id: v64.expeidnull
       author: nvoxland
       comment: Make exploration.entity_id nullable so serdes drop-entity-ids! can NULL it

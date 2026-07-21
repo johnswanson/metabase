@@ -9,6 +9,7 @@
    [metabase.events.core :as events]
    [metabase.explorations.core :as explorations]
    [metabase.explorations.models.exploration :as expl.model]
+   [metabase.explorations.queues :as explorations.queues]
    [metabase.request.core :as request]
    [metabase.util.malli.registry :as mr]
    [metabase.util.malli.schema :as ms]
@@ -36,6 +37,24 @@
 
 (defn- hydrate-exploration [exploration]
   (t2/hydrate exploration :creator :can_write :collection :threads))
+
+(defn- positional-rows
+  "Stamp `:exploration_thread_id` and a 0-based `:position` onto each row in `rows`."
+  [thread-id rows]
+  (map-indexed (fn [i row]
+                 (assoc row :exploration_thread_id thread-id :position i))
+               rows))
+
+(defn- insert-blocks!
+  "Persist the FE's Research-plan blocks verbatim — one `ExplorationBlock` row per
+   block, in payload order. Each block keeps its own `:metrics`/`:dimensions` selection;
+   the planners cross metrics with dimensions only within a block. No dedup across blocks:
+   a metric or dimension appearing in two blocks is stored on both."
+  [thread-id blocks]
+  (when (seq blocks)
+    (t2/insert! :model/ExplorationBlock
+                (positional-rows thread-id
+                                 (map #(select-keys % [:type :metrics :dimensions]) blocks)))))
 
 ;;; ----------------------------------------- schemas -----------------------------------------
 
@@ -102,13 +121,42 @@
    [:offset [:maybe ms/IntGreaterThanOrEqualToZero]]
    [:data   [:sequential ::ExplorationSummary]]])
 
+(def ^:private MetricSelection
+  [:map
+   [:card_id ms/PositiveInt]
+   [:dimension_mappings {:optional true} [:maybe [:sequential :map]]]])
+
+(def ^:private DimensionSelection
+  [:map
+   [:dimension_id   ms/NonBlankString]
+   [:display_name   {:optional true} [:maybe :string]]
+   [:effective_type {:optional true} [:maybe :string]]
+   [:semantic_type  {:optional true} [:maybe :string]]])
+
+(def ^:private BlockSelection
+  "One Research-plan area on the FE — either a metric area (one primary metric + chosen dimensions)
+   or a dimension area (the dimension's group + referencing metrics). Persisted verbatim as one
+   `ExplorationBlock` row; the planners cross this block's metrics with this block's
+   dimensions only. The sidebar heading is computed read-side (the `:name` of an
+   `ExplorationBlockNode`), not supplied here."
+  [:map
+   ;; Whether the block is anchored on its metric or its dimension. The read side
+   ;; uses this to build the sidebar heading + sub-item names.
+   [:type       {:optional true} [:maybe [:enum "metric" "dimension"]]]
+   [:metrics    {:optional true} [:maybe [:sequential MetricSelection]]]
+   [:dimensions {:optional true} [:maybe [:sequential DimensionSelection]]]])
+
 (def ^:private CreateExploration
-  "Body schema for `POST /api/exploration`."
+  "Body schema for `POST /api/exploration`.
+
+   The FE sends one entry per Research-plan block (`:blocks` — each a metric/dimension
+   area), each persisted verbatim."
   [:map
    [:name          expl.model/ExplorationName]
    [:description   {:optional true} [:maybe :string]]
    [:prompt        {:optional true} [:maybe :string]]
-   [:collection_id {:optional true} [:maybe ms/PositiveInt]]])
+   [:collection_id {:optional true} [:maybe ms/PositiveInt]]
+   [:blocks        {:optional true} [:maybe [:sequential BlockSelection]]]])
 
 (def ^:private UpdateExploration
   "Body schema for `PUT /api/exploration/:id`. All fields are optional; only the keys the client
@@ -158,24 +206,40 @@
 ;;; ----------------------------------------- endpoints -----------------------------------------
 
 (api.macros/defendpoint :post "/" :- ::HydratedExploration
-  "Create a new exploration with a single thread and stamp the thread as started."
+  "Create a new exploration with a single thread, persist the user's selected metrics and
+  dimensions, and stamp the thread as started. Actual planning is async; this endpoint returns
+  immediately with an empty queries list. Clients should poll `GET /:id/queries` until rows appear.
+
+  Accepts the per-area `:blocks` payload (one entry per Research-plan block), persisted verbatim."
   [_route-params
    _query-params
-   {:keys [name description prompt collection_id]} :- CreateExploration]
+   {:keys [name description prompt collection_id blocks]} :- CreateExploration]
   (api/create-check :model/Exploration {:collection_id collection_id})
+  ;; Block metric-card references are persisted verbatim and read back unfiltered
+  ;; (planning context, thread hydration), so attach time is the
+  ;; permission boundary: every referenced id must exist (404) and be readable (403) by the creator.
+  (doseq [card-id (distinct (mapcat #(map :card_id (:metrics %)) blocks))]
+    (api/read-check :model/Card card-id))
   (let [persisted
         (t2/with-transaction [_]
           (let [exploration (first (t2/insert-returning-instances! :model/Exploration
                                                                    {:name          name
                                                                     :description   description
                                                                     :collection_id collection_id
-                                                                    :creator_id    api/*current-user-id*}))]
-            ;; `started_at` marks the thread as started (past the draft phase).
-            (t2/insert! :model/ExplorationThread
-                        {:exploration_id (:id exploration)
-                         :prompt         prompt
-                         :position       0
-                         :started_at     (t/offset-date-time)})
+                                                                    :creator_id    api/*current-user-id*}))
+                ;; `started_at` marks the thread as started (past the draft phase). Planning itself
+                ;; is kicked off by the `start-thread!` enqueue below — its plan message rides a
+                ;; `:transactional :require` queue, so it publishes only once this whole transaction,
+                ;; including the dependent block rows below, commits atomically.
+                ;; The plan listener therefore can never observe (or plan) a half-built thread.
+                thread      (first (t2/insert-returning-instances! :model/ExplorationThread
+                                                                   {:exploration_id (:id exploration)
+                                                                    :prompt         prompt
+                                                                    :position       0
+                                                                    :started_at     (t/offset-date-time)}))
+                tid         (:id thread)]
+            (insert-blocks! tid blocks)
+            (explorations.queues/start-thread! tid)
             (t2/select-one :model/Exploration :id (:id exploration))))]
     ;; Published after the transaction commits (matching PUT) so listeners can never observe an
     ;; exploration that isn't visible to other connections yet.
