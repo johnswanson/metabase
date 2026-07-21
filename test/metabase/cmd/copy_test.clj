@@ -38,6 +38,7 @@
     :model/DatabaseRouter
     :model/Dependency
     :model/DependencyStatus
+    :model/ExplorationQueryResult
     :model/McpQueryHandle
     :model/McpSessionLog
     :model/McpToolCallLog
@@ -65,6 +66,8 @@
     :model/SourceSegmentCompositeDaily
     :model/SourceSegmentDaily
     :model/SsoRelayState
+    :model/StoredResult
+    :model/StoredResultUse
     :model/SupportAccessGrantLog
     :model/TableIndex
     :model/TaskHistory

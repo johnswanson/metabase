@@ -262,6 +262,7 @@ export type IconName =
   | "table"
   | "table2"
   | "table_index"
+  | "telescope"
   | "text_bold"
   | "text_italic"
   | "text_strike"
