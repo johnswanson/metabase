@@ -65,6 +65,8 @@
     :model/ExplorationThread
     :model/ExplorationBlock
     :model/ExplorationPage
+    :model/StoredResult
+    :model/StoredResultUse
     :model/CollectionPermissionGraphRevision
     :model/DashboardCardSeries
     :model/LoginHistory
