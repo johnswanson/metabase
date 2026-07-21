@@ -151,6 +151,8 @@
       (let [sql-dialect          (or (get context :sql_dialect)
                                      (get context :sql-dialect))
             {:keys [always-on catalog]} (skills/build-skill-manifest profile (keys tools) capabilities)
+            research-plan        (or (get context :research_plan)
+                                     (get context :research-plan))
             perms                (or scope/*current-user-metabot-permissions*
                                      scope/perm-type-defaults)
             ;; The SQL guidance tells the model to load SQL skills and use the SQL tools, so gate it
@@ -168,6 +170,7 @@
                                   ;; load, nudging the model into pointless `load_skill` calls.
                                   :skill_catalog            (not-empty catalog)
                                   :skill_always_on          (mapv :body always-on)
+                                  :research_plan            research-plan
                                   :has_sql_generation       has-sql?
                                   :has_nlq                  has-nlq?
                                   :has_query_tools          (or has-sql? has-nlq?)
