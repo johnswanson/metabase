@@ -6,6 +6,7 @@ import type {
   Exploration,
   ExplorationId,
   ExplorationQueryId,
+  ExploreFurtherRequest,
   GetExplorationDataRequest,
   GetExplorationDataResponse,
   GetMyExplorationsRequest,
@@ -72,6 +73,15 @@ export const explorationApi = Api.injectEndpoints({
           listTag("exploration"),
         ]),
     }),
+    exploreFurther: builder.mutation<Exploration, ExploreFurtherRequest>({
+      query: ({ id, ...body }) => ({
+        method: "POST",
+        url: `/api/exploration/${id}/explore-further`,
+        body,
+      }),
+      invalidatesTags: (_, error, { id }) =>
+        invalidateTags(error, [idTag("exploration", id)]),
+    }),
     restartExploration: builder.mutation<
       Exploration,
       RestartExplorationRequest
@@ -114,6 +124,41 @@ export const explorationApi = Api.injectEndpoints({
       // subscriber unmounts so that flipping between previously-viewed queries
       // inside one session is instant (no skeleton flash on re-select).
       keepUnusedDataFor: 30 * 60,
+    }),
+    setPageStarred: builder.mutation<
+      void,
+      { pageId: number; explorationId: ExplorationId; starred: boolean }
+    >({
+      query: ({ pageId, starred }) => ({
+        method: "PUT",
+        url: `/api/exploration/page/${pageId}/starred`,
+        body: { starred },
+      }),
+      async onQueryStarted(
+        { pageId, explorationId, starred },
+        { dispatch, queryFulfilled },
+      ) {
+        const patchResult = dispatch(
+          explorationApi.util.updateQueryData(
+            "getExploration",
+            explorationId,
+            (draft) => {
+              // casting as Exploration prevents excessively deep type error
+              const page = getExplorationPages(draft as Exploration).find(
+                (page) => page.id === pageId,
+              );
+              if (page) {
+                page.starred = starred;
+              }
+            },
+          ),
+        );
+        try {
+          await queryFulfilled;
+        } catch {
+          patchResult.undo();
+        }
+      },
     }),
     setPagesHidden: builder.mutation<
       void,
@@ -158,10 +203,12 @@ export const {
   useGetExplorationQuery,
   useGetMyExplorationsQuery,
   useCreateExplorationMutation,
+  useExploreFurtherMutation,
   useUpdateExplorationMutation,
   useRestartExplorationMutation,
   useDeleteExplorationMutation,
   useCancelExplorationThreadMutation,
   useGetExplorationQueryResultQuery,
+  useSetPageStarredMutation,
   useSetPagesHiddenMutation,
 } = explorationApi;
