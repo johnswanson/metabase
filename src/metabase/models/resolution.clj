@@ -50,6 +50,7 @@
     :model/EmbeddingTheme                    metabase.embedding.models.theme
     :model/Exploration                       metabase.explorations.models.exploration
     :model/ExplorationBlock                  metabase.explorations.models.exploration-block
+    :model/ExplorationBookmark               metabase.bookmarks.models.bookmark
     :model/ExplorationPage                   metabase.explorations.models.exploration-page
     :model/ExplorationQuery                  metabase.explorations.models.exploration-query
     :model/ExplorationQueryResult            metabase.explorations.models.exploration-query-result
