@@ -197,6 +197,11 @@
              :content_type "application/json+vnd.prose-mirror"
              :creator_id (rasta-id)}))
 
+   :model/Exploration
+   (fn [_] (default-timestamped
+            {:creator_id (rasta-id)
+             :name (u.random/random-name)}))
+
    :model/Field
    (fn [_] (default-timestamped
             {:database_type "VARCHAR"

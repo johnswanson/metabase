@@ -86,6 +86,8 @@
    "Dependency"
    "DependencyStatus"
    "DocumentBookmark"
+   "Exploration"
+   "ExplorationThread"
    "HTTPAction"
    "ImplicitAction"
    "LoginHistory"
